@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>ENR Implementation Review</title>
+<style>
+@page { size: A4; margin: 13mm 13mm 14mm; }
+* { box-sizing: border-box; }
+body { font: 8.6pt/1.38 "DejaVu Sans", Arial, sans-serif; color: #111; margin: 0; background: #fff; }
+h1 { font-size: 16pt; margin: 0 0 2px; }
+.sub { color: #555; font-size: 8pt; margin-bottom: 8px; border-bottom: 2px solid #2a5db0; padding-bottom: 5px; }
+h2 { font-size: 11pt; color: #fff; background: #2a5db0; margin: 12px 0 5px; padding: 2px 6px; break-after: avoid; }
+h3 { font-size: 9.4pt; color: #2a5db0; margin: 9px 0 3px; border-bottom: 0.6px solid #c5d3ea; break-after: avoid; }
+h4 { font-size: 8.8pt; margin: 6px 0 2px; break-after: avoid; }
+p { margin: 3px 0; }
+ul, ol { margin: 2px 0 4px; padding-left: 17px; } li { margin: 1px 0; }
+code, pre { font-family: "DejaVu Sans Mono", monospace; font-size: 7.4pt; }
+code { background: #f1f4f9; padding: 0 2px; border-radius: 2px; }
+pre { background: #f1f4f9; border-left: 2.5px solid #2a5db0; padding: 4px 6px; margin: 4px 0; white-space: pre-wrap; line-height: 1.28; break-inside: avoid; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 4px 0 6px; break-inside: auto; }
+tr { break-inside: avoid; }
+td, th { border: 0.6px solid #bbb; padding: 2px 4px; vertical-align: top; text-align: left; }
+th { background: #e3e9f3; }
+.code { color: #0b6b2e; font-weight: bold; }
+.stats { color: #8a3d00; font-weight: bold; }
+.w { background: #fff4d6; border-left: 3px solid #d99a00; padding: 3px 6px; margin: 4px 0; break-inside: avoid; }
+.n { background: #eef6ee; border-left: 3px solid #2e8b4a; padding: 3px 6px; margin: 4px 0; break-inside: avoid; }
+.ln { color: #2a5db0; font-family: "DejaVu Sans Mono", monospace; font-size: 7.4pt; white-space: nowrap; }
+.toc { column-count: 2; column-gap: 18px; font-size: 8.2pt; }
+.toc div { margin: 0.5px 0; }
+.pb { break-before: page; }
+.small { font-size: 7.6pt; color: #444; }
+svg text { font-family: "DejaVu Sans", Arial, sans-serif; }
+</style></head><body>
+
+<h1>ENR modifications to Turbo 1.2.8: implementation review</h1>
+<div class="sub">Everything that differs from upstream in <code>~/Scrivania/turbo-1.2.8</code> (plus the local <code>~/Scrivania/lala-core</code> clone), with data structures, control flow and line references, for a line-by-line review.
+State of 2026-11-23. Line numbers are those of the current files. The restart code is not committed (last commit <code>401ff93</code>, 2026-11-16, already contains the statistics instrumentation of 11-06..11-11).</div>
+
+<div class="toc">
+<div>0. The picture: structures and flow</div>
+<div>1. Comment convention and where the markers are</div>
+<div>2. Overview: what was implemented</div>
+<div>3. ENR CODE &mdash; heap sizing</div>
+<div>4. ENR CODE &mdash; <code>meet</code> race fix in the E-skip</div>
+<div>5. ENR CODE &mdash; load-balancing restart: options</div>
+<div>6. ENR CODE &mdash; restart: data structures</div>
+<div>7. ENR CODE &mdash; restart: host side (memory, launch)</div>
+<div>8. ENR CODE &mdash; restart: the kernel, step by step</div>
+<div>9. ENR CODE &mdash; restart: trigger in <code>propagate()</code></div>
+<div>10. Correctness arguments to check</div>
+<div>11. ENR STATS &mdash; restart statistics (enr_tree_nodes, enr_restart_*)</div>
+<div>12. ENR STATS &mdash; profiling instrumentation (phases, histograms, idle)</div>
+<div>13. ENR STATS &mdash; simplification dump/trace, local lala-core</div>
+<div>14. Review checklist: open points and things I would look at</div>
+<div>15. How to remove the stats / turn the restart off</div>
+</div>
+
+<h2 class="pb">0. The picture: what was added, on which structures</h2>
+<svg width="100%" viewBox="0 0 760 1010" style="display:block">
+<style>
+.T{font-size:13px;font-weight:bold}.h{font-size:11.5px;font-weight:bold}.t{font-size:10px}.m{font-size:9.5px;font-family:"DejaVu Sans Mono",monospace}
+.up{fill:#f4f4f4;stroke:#999}.cd{fill:#eaf6ee;stroke:#1f7a3d;stroke-width:1.6}.st{fill:#fdf0e3;stroke:#b5651d;stroke-width:1.6}.box{fill:#fff;stroke:#2a5db0;stroke-width:1.4}
+.cg{fill:#0b6b2e}.sg{fill:#8a3d00}.gy{fill:#555}
+.ar{stroke:#2a5db0;stroke-width:1.4;fill:none;marker-end:url(#a)}.ar2{stroke:#1f7a3d;stroke-width:1.4;fill:none;stroke-dasharray:4,3;marker-end:url(#a2)}
+</style>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#2a5db0"/></marker>
+<marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#1f7a3d"/></marker></defs>
+
+<!-- legend -->
+<rect x="10" y="6" width="14" height="11" class="up"/><text x="28" y="15" class="t">upstream (unchanged)</text>
+<rect x="160" y="6" width="14" height="11" class="cd"/><text x="178" y="15" class="t cg">ENR CODE (changes the search)</text>
+<rect x="370" y="6" width="14" height="11" class="st"/><text x="388" y="15" class="t sg">ENR STATS (measures / prints only)</text>
+<text x="600" y="15" class="t gy">B = number of blocks</text>
+
+<!-- HOST -->
+<rect x="10" y="28" width="360" height="232" class="box" rx="4"/>
+<text x="20" y="46" class="h">HOST  (CPU, barebones_dive_and_solve)</text>
+<rect x="20" y="54" width="340" height="50" class="cd"/>
+<text x="26" y="68" class="t cg" font-weight="bold">Configuration (config.hpp / config.cpp)</text>
+<text x="26" y="82" class="m">enr_restart_idle_pct    (-restart P)</text>
+<text x="26" y="95" class="m">enr_restart_each_block  (-restart_each_block)</text>
+<rect x="20" y="110" width="340" height="80" class="cd"/>
+<text x="26" y="124" class="t cg" font-weight="bold">configure_gpu_barebones()</text>
+<text x="26" y="138" class="t">heap = 95% of cudaMemGetInfo free memory</text>
+<text x="26" y="151" class="t">mem_per_block += snapshot + 1024 EnrFrontierItem</text>
+<text x="26" y="164" class="t">cooperative check: num_blocks &#8804; max resident blocks</text>
+<text x="26" y="180" class="t">launch: cudaLaunchCooperativeKernel  |  &lt;&lt;&lt;B,256&gt;&gt;&gt; if off</text>
+<rect x="20" y="196" width="340" height="56" class="up"/>
+<text x="26" y="210" class="t" font-weight="bold">poll loop + reduce_blocks + print</text>
+<text x="26" y="224" class="t">timeout / CTRL-C &#8594; UnifiedData.stop</text>
+<text x="26" y="238" class="t sg">reduce_blocks: enr_st_* &#8594; root Statistics, idle timeline</text>
+<text x="26" y="250" class="t sg">print_enr_restart_statistics, print_enr_statistics</text>
+
+<!-- UnifiedData -->
+<rect x="390" y="28" width="360" height="232" class="box" rx="4"/>
+<text x="400" y="46" class="h">UnifiedData  (managed memory, CPU+GPU)</text>
+<rect x="400" y="54" width="340" height="48" class="up"/>
+<text x="406" y="68" class="m">root : GridCP  (store, iprop, config, stats)</text>
+<text x="406" y="82" class="m">stop : atomic_flag</text>
+<text x="406" y="96" class="t cg">with -restart: node limit sets stop for the whole grid</text>
+<rect x="400" y="110" width="340" height="142" class="st"/>
+<text x="406" y="124" class="t sg" font-weight="bold">root.stats : Statistics   (statistics.hpp)</text>
+<text x="406" y="139" class="m">enr_tree_nodes  enr_tree_fails</text>
+<text x="406" y="152" class="m">enr_restart_mode enr_restarts enr_restart_items_*</text>
+<text x="406" y="165" class="m">enr_restart_subproblems_sum enr_restart_s_max</text>
+<text x="406" y="178" class="m">enr_restart_drain_ns_* enr_restart_first/last_ns</text>
+<text x="406" y="193" class="m">enr_ph_ns[8] enr_ph_cnt[8]  (EnrPhase)</text>
+<text x="406" y="206" class="m">enr_node_fp_hist enr_rs_hist enr_rs_*</text>
+<text x="406" y="219" class="m">enr_*_block_min/max enr_idle_ns_sum</text>
+<text x="406" y="232" class="m">enr_idle_pct_slice[20] enr_busy_end_slice</text>
+<text x="406" y="245" class="m">Timer::BACKTRACK_ENR</text>
+
+<!-- GridData -->
+<rect x="10" y="272" width="740" height="228" class="box" rx="4"/>
+<text x="20" y="290" class="h">GridData  (global memory, one for the grid, shared by all blocks)</text>
+<rect x="20" y="298" width="200" height="194" class="up"/>
+<text x="26" y="313" class="m">blocks[B] : BlockData</text>
+<text x="26" y="328" class="m">next_subproblem : ZLB</text>
+<text x="26" y="341" class="t cg">  E-skip: atomic fetch_max</text>
+<text x="26" y="354" class="t cg">  reset to B every round</text>
+<text x="26" y="369" class="m">appx_best_bound</text>
+<text x="26" y="382" class="t cg">  exact min every round</text>
+<text x="26" y="397" class="m">search_strategies</text>
+<text x="26" y="410" class="m">obj_var  print_lock</text>
+<rect x="228" y="298" width="300" height="194" class="cd"/>
+<text x="234" y="313" class="m">enr_restart_enabled  enr_restart_threshold</text>
+<text x="234" y="326" class="m">enr_restart_target T = subfactor&#183;B</text>
+<text x="234" y="339" class="m">enr_items_per_block = 1024</text>
+<text x="234" y="355" class="m" font-weight="bold">enr_items[B&#183;1024] : EnrFrontierItem</text>
+<text x="234" y="370" class="m">enr_restart_flag   (set by an idle block)</text>
+<text x="234" y="383" class="m">enr_idle_blocks    (atomic)</text>
+<text x="234" y="396" class="m">enr_n_items[2]     (atomic, [enr_round&amp;1])</text>
+<text x="234" y="409" class="m">enr_host_stop</text>
+<rect x="250" y="446" width="256" height="40" fill="#fff" stroke="#1f7a3d"/>
+<text x="258" y="461" class="m" font-weight="bold">struct EnrFrontierItem  (8 B)</text>
+<text x="258" y="477" class="m">int snap; uint k:31; uint c:1;</text>
+<rect x="536" y="298" width="204" height="194" class="st"/>
+<text x="542" y="313" class="m">enr_raise_ns  enr_kernel_start_ns</text>
+<text x="542" y="326" class="m">enr_pending_drain_ns</text>
+<text x="542" y="339" class="m">enr_pending_raise_ns</text>
+<text x="542" y="354" class="m">enr_st_items_sum/max/last</text>
+<text x="542" y="367" class="m">enr_st_subproblems_sum</text>
+<text x="542" y="380" class="m">enr_st_s_max  enr_st_truncated</text>
+<text x="542" y="393" class="m">enr_st_drain_sum/max</text>
+<text x="542" y="406" class="m">enr_st_first_ns enr_st_last_ns</text><text x="542" y="419" class="m">enr_st_restarts</text>
+<text x="542" y="444" class="t sg">copied to root.stats</text>
+<text x="542" y="457" class="t sg">by reduce_blocks</text>
+
+<!-- BlockData -->
+<rect x="10" y="512" width="740" height="160" class="box" rx="4"/>
+<text x="20" y="530" class="h">BlockData  &#215; B  (blocks[b], global memory; store/iprop may be in shared memory)</text>
+<rect x="20" y="538" width="250" height="126" class="up"/>
+<text x="26" y="553" class="m">root_store  store  iprop</text>
+<text x="26" y="566" class="m">best_store  best_bound</text>
+<text x="26" y="579" class="m">decisions[] : LightBranch</text>
+<text x="26" y="592" class="m">  var children[2] ropes[2]</text>
+<text x="26" y="605" class="m">  current_idx</text>
+<text x="26" y="618" class="m">depth  subproblem_idx</text>
+<text x="26" y="631" class="m">snapshot_root_strategy</text>
+<text x="26" y="644" class="m">snapshot_next_unassigned_var</text>
+<text x="26" y="657" class="m">stats : Statistics</text>
+<rect x="278" y="538" width="236" height="126" class="cd"/>
+<text x="284" y="553" class="t cg" font-weight="bold">snapshot (enr_allocate_snapshot)</text>
+<text x="284" y="568" class="m">enr_snap_store  = subroot (root_store)</text>
+<text x="284" y="581" class="m">enr_snap_dec[]  = path subroot&#8594;node</text>
+<text x="284" y="594" class="m">enr_snap_root_strategy</text>
+<text x="284" y="640" class="t cg">written at harvest, read-only</text>
+<text x="284" y="653" class="t cg">by every block in the next round</text>
+<rect x="522" y="538" width="218" height="126" class="st"/>
+<text x="528" y="553" class="m">enr_in_tree</text>
+<text x="528" y="566" class="m">enr_wait_from/to[256]</text>
+<text x="528" y="579" class="m">enr_n_waits enr_wait_ns</text>
+<text x="528" y="592" class="m">enr_wait_begin</text>
+<text x="528" y="605" class="m">enr_ph_t</text>
+<text x="528" y="618" class="m">enr_after_restore</text>
+<text x="528" y="631" class="m">enr_restore_ns/_path/_start</text>
+<text x="528" y="651" class="t sg">stats.enr_tree_nodes, stats.enr_*</text>
+<!-- item -> snapshot arrow -->
+<path d="M378,486 C378,505 360,520 340,540" class="ar2"/>
+<text x="392" y="503" class="t cg">enr_items[j].snap = b &#8594; snapshot of blocks[b]</text>
+
+<!-- KERNEL FLOW -->
+<rect x="10" y="684" width="740" height="320" class="box" rx="4"/>
+<text x="20" y="702" class="h">gpu_barebones_solve (per block)</text><text x="260" y="702" class="m cg">__shared__ enr_restart enr_open_subproblem enr_s_bits num_subproblems enr_cur_item</text>
+
+<rect x="20" y="712" width="350" height="252" class="up"/>
+<text x="26" y="727" class="t" font-weight="bold">while(true)  — round loop  <tspan class="cg">(ENR CODE)</tspan></text>
+<text x="26" y="743" class="t" font-weight="bold">  while(idx &lt; num_subproblems &amp;&amp; !stop)  — upstream EPS loop</text>
+<rect x="34" y="750" width="326" height="30" class="cd"/>
+<text x="40" y="763" class="t">C: round 0 global root | C': rebuild enr_items[idx&gt;&gt;enr_s_bits]</text>
+<text x="40" y="776" class="t">from blocks[snap] snapshot, take child c</text>
+<rect x="34" y="784" width="326" height="18" class="cd"/>
+<text x="40" y="797" class="t">D: dive remaining_depth = enr_s_bits levels (low bits of idx)</text>
+<rect x="34" y="806" width="326" height="18" class="cd"/>
+<text x="40" y="819" class="t">E: failed dive &#8594; next_subproblem.fetch_max(...)</text>
+<rect x="34" y="828" width="326" height="58" class="up"/>
+<text x="40" y="841" class="t">F: DFS  I bound · II propagate() · III split · IV backtrack</text>
+<text x="40" y="855" class="t cg">propagate(): one load of enr_restart_flag per node;</text>
+<text x="40" y="868" class="t cg">  flag up &#8594; enr_restart = true</text>
+<text x="40" y="881" class="t cg">end of body: if(enr_restart) enr_open_subproblem = !stop; break</text>
+<rect x="34" y="890" width="326" height="18" class="up"/>
+<text x="40" y="903" class="t">G: idx = next_subproblem++</text>
+<rect x="34" y="912" width="326" height="44" class="cd"/>
+<text x="40" y="925" class="t">if !enr_restart_enabled: break  (upstream end)</text>
+<text x="40" y="938" class="t">idle: enr_idle_blocks++; == threshold &#8594; raise flag</text>
+<text x="40" y="951" class="t sg">phase charge, enr_wait_begin</text>
+
+<rect x="400" y="712" width="340" height="30" class="cd"/>
+<text x="408" y="731" class="t" font-weight="bold">S1  grid.sync()   ++enr_round   (all blocks stopped)</text>
+<rect x="400" y="752" width="164" height="94" class="cd"/>
+<text x="406" y="766" class="t" font-weight="bold">harvest</text>
+<text x="406" y="779" class="t">(if enr_open_subproblem)</text>
+<text x="406" y="793" class="t">root_store&#8594;enr_snap_store</text>
+<text x="406" y="806" class="t">decisions&#8594;enr_snap_dec</text>
+<text x="406" y="819" class="t">items (k,1) pending +</text>
+<text x="406" y="832" class="t">current; enr_n_items[r&amp;1]</text>
+<rect x="572" y="752" width="168" height="94" class="cd"/>
+<text x="578" y="766" class="t" font-weight="bold">reset_round (block 0)</text>
+<text x="578" y="779" class="t">exact appx_best_bound</text>
+<text x="578" y="792" class="t">enr_host_stop = stop.test()</text>
+<text x="578" y="805" class="t">next_subproblem = B</text>
+<text x="578" y="818" class="t">idle = 0, flag = 0</text>
+<text x="578" y="831" class="t">enr_n_items[(r+1)&amp;1] = 0</text>
+<text x="578" y="843" class="t sg">drain time</text>
+<rect x="400" y="856" width="340" height="30" class="cd"/>
+<text x="408" y="875" class="t" font-weight="bold">S3  grid.sync()</text>
+<rect x="400" y="896" width="340" height="60" class="cd"/>
+<text x="408" y="910" class="t" font-weight="bold">plan:  n = enr_n_items[r&amp;1]</text>
+<text x="408" y="924" class="t">n == 0 or enr_host_stop &#8594; exit kernel (all blocks)</text>
+<text x="408" y="938" class="t">else s = min s with n&#183;2^s &#8805; T, num_subproblems = n&lt;&lt;s,</text>
+<text x="408" y="951" class="t">idx = blockIdx.x <tspan class="sg">(+ enr_st_* stats)</tspan></text>
+
+<path d="M360,935 C385,935 380,727 398,727" class="ar"/>
+<path d="M570,742 L570,750" class="ar"/>
+<path d="M570,846 L570,854" class="ar"/>
+<path d="M570,886 L570,894" class="ar"/>
+<path d="M570,956 L570,975 L195,975 L195,966" class="ar"/>
+<text x="210" y="992" class="t">&#8593; next round: back to the subproblem loop with the new enr_s_bits / num_subproblems</text>
+</svg>
+
+<h2 class="pb">1. Comment convention and where the markers are</h2>
+<table>
+<tr><th style="width:22%">marker</th><th>meaning</th></tr>
+<tr><td><span class="code">//ENR CODE</span></td><td>Code that changes what the solver computes or how it runs: heap sizing, the <code>meet</code> race fix, the whole load-balancing restart (options, data, launch, round loop, harvest, rebuild, trigger). Removing it changes behaviour.</td></tr>
+<tr><td><span class="stats">//ENR STATS</span></td><td>Code that only measures or prints: restart counters, <code>enr_tree_nodes</code>, the <code>enr_*</code> profiling, the simplification dump/trace, the local lala-core build switch. Removing it does not change the search (only its timing overhead).</td></tr>
+<tr><td><code>-- begin</code> / <code>-- end</code></td><td>Suffix for a multi-line block. A one-line suffix <code>: text</code> explains that line. <code>-- whole function.</code> = the whole function below is ENR.</td></tr>
+</table>
+<p>String literals (<code>"% [ENR] ..."</code>, <code>"ENR statistics"</code>), identifiers (<code>enr_*</code>, <code>ENR_PH</code>, <code>BACKTRACK_ENR</code>, <code>LALA_CORE_LOCAL_ENR</code>) and the env var <code>ENR_PRINT_CP</code> are not markers.</p>
+<table>
+<tr><th>file</th><th>lines with <span class="code">ENR CODE</span></th><th>lines with <span class="stats">ENR STATS</span></th></tr>
+<tr><td><code>include/barebones_dive_and_solve.hpp</code></td><td>56</td><td>116</td></tr>
+<tr><td><code>include/statistics.hpp</code></td><td>0</td><td>29</td></tr>
+<tr><td><code>include/config.hpp</code></td><td>9</td><td>6 (printing of the restart options)</td></tr>
+<tr><td><code>src/config.cpp</code></td><td>8</td><td>0</td></tr>
+<tr><td><code>include/common_solving.hpp</code></td><td>0</td><td>18</td></tr>
+<tr><td><code>CMakeLists.txt</code></td><td>0</td><td>2 (<code># ENR STATS -- begin/end</code>)</td></tr>
+<tr><td><code>~/Scrivania/lala-core/include/lala/{fixpoint,simplifier}.hpp</code></td><td>0</td><td>3</td></tr>
+</table>
+<p>No line mixes the two kinds: every statement is either CODE or STATS.</p>
+<p class="small">Find everything: <code>grep -rn "ENR CODE\|ENR STATS" include src CMakeLists.txt</code>.</p>
+<h3>Names</h3>
+<p><b>root</b> = the initial problem (<code>UnifiedData::root</code>, never changes). <b>subroot</b> = the root of the subproblem a block is solving (<code>BlockData::root_store</code>, taken at depth 0 of step F). An item <code>(snap, k, c)</code> = from the subroot of block <code>snap</code>, follow its path to level k and take child c.</p>
+<p>Every name introduced by ENR starts with <code>enr_</code> (variables, fields, functions, printed statistics) or <code>Enr</code> (types: <code>EnrFrontierItem</code>, <code>EnrPhase</code>); macros and constants use <code>ENR_</code> (<code>ENR_PH</code>, <code>ENR_HIST</code>, <code>ENR_TL</code>, <code>ENR_MAX_WAITS</code>). Exceptions, on purpose: the command-line flags stay <code>-restart</code> and <code>-restart_each_block</code> (job scripts use them), the timer <code>Timer::BACKTRACK_ENR</code>, and the short locals that live inside one ENR block (<code>n</code>, <code>s</code>, <code>k</code>, <code>w</code>, <code>pending</code>, <code>keep</code>, <code>last_k</code>, <code>src</code>, <code>grid</code>, ...). Upstream names whose meaning changed keep their name (<code>num_subproblems</code>, now <code>__shared__</code>).</p>
+<p>Name clash handled: before 2026-11-11 the printed <code>enr_restart_*</code> statistics (section 7b of <code>stats_explained.txt</code>) meant <em>one backtrack</em> (restore + its fixpoint). Now <code>enr_restart_*</code> means only the load-balancing restart; the backtrack function is <code>enr_record_backtrack</code> (was <code>enr_record_restart</code>); its fields keep the short prefix <code>enr_rs_*</code>. No current identifier collides. <code>compare_restart_stats.py</code> and <code>analyze_mznc_results.py</code> map the new printed names to the old keys, so logs from before (e.g. the MZN 2024 series) and after are read the same way. The rename changes no machine code: the GPU SASS of the rebuilt binary is identical to the previous one (<code>build/gpu-release/turbo.before_rename</code>), the solve kernel still uses 98 registers, and <code>benchmarks/enr_small</code> passes 12/12.</p>
+
+<h2>2. Overview: what was implemented</h2>
+<table>
+<tr><th style="width:24%">piece</th><th style="width:11%">kind</th><th>where</th><th>effect</th></tr>
+<tr><td>Heap from free memory</td><td class="code">CODE</td><td><span class="ln">barebones:732-738</span></td><td><code>cudaLimitMallocHeapSize</code> = 95% of the <em>free</em> GPU memory (upstream: share of the total), avoids <code>cudaErrorLaunchOutOfResources</code> on the laptop GPU shared with the display.</td></tr>
+<tr><td><code>meet</code> race fix</td><td class="code">CODE</td><td><span class="ln">barebones:1035-1040</span></td><td>E-skip uses an atomic <code>fetch_max</code> instead of the load/compare/store <code>meet</code> loop, which could move the subproblem counter backwards. Active also without <code>-restart</code>.</td></tr>
+<tr><td>Load-balancing restart</td><td class="code">CODE</td><td>config.hpp, config.cpp, barebones (data, launch, kernel, propagate)</td><td>When <code>-restart P</code> % of the blocks are idle, all busy blocks stop at the end of their current node, publish their open nodes, and all blocks re-split these nodes EPS-style into &ge; <code>subfactor&middot;B</code> subproblems (upstream <code>-subfactor</code>, default 30). <code>-restart_each_block</code> = restart when the first block is idle. Off by default; off = old code path + normal <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> launch.</td></tr>
+<tr><td>Restart statistics</td><td class="stats">STATS</td><td>statistics.hpp, barebones</td><td><code>enr_tree_nodes</code>, <code>enr_tree_failures</code>, <code>enr_redundant_dive_nodes</code>, <code>enr_restarts</code>, <code>enr_restart_items_*</code>, <code>enr_restart_s_max</code>, drain times, barrier waits in the idle timeline.</td></tr>
+<tr><td>Profiling (<code>enr_*</code>)</td><td class="stats">STATS</td><td>statistics.hpp, barebones</td><td>8 exclusive phases + idle = 100 %, per-node fixpoint histogram, backtrack cost histogram, cross-block load balance, 20-slice idle timeline, blocks done.</td></tr>
+<tr><td>Simplification dump/trace</td><td class="stats">STATS</td><td>common_solving.hpp, CMakeLists.txt, lala-core clone</td><td><code>ENR_PRINT_CP=1|2</code>: problem before/after simplification and a step-by-step trace; local lala-core build for 4 read-only getters.</td></tr>
+</table>
+
+<h2>3. ENR CODE &mdash; heap sizing (<span class="ln">barebones:732-738</span>, <code>configure_gpu_barebones</code>)</h2>
+<pre><code>//ENR CODE -- begin: heap sized from the free memory (upstream: share of the total memory).
+size_t free_mem, total_mem;
+CUDAEX(cudaMemGetInfo(&amp;free_mem, &amp;total_mem));
+CUDAEX(cudaDeviceSetLimit(cudaLimitMallocHeapSize, free_mem / 100 * 95)); // 95% of the free memory (was 80%)
+//ENR CODE -- end</code></pre>
+<p>Upstream reserves 97% of <code>totalGlobalMem</code>; when part of the GPU is taken (display), nothing is left for the per-launch local memory (stack) and every launch fails. Changed 2026-11-04 (80%), 2026-11-20 to 95% (also on MeluXina). The heap is what <code>bt::global_allocator</code> (device <code>malloc</code>) uses: <code>BlockData</code> stores, decisions, and with <code>-restart</code> the snapshots and the items vector.</p>
+
+<h2>4. ENR CODE &mdash; <code>meet</code> race fix in the E-skip (<span class="ln">barebones:1035-1040</span>)</h2>
+<pre><code>size_t next_subproblem_idx = ((block_data.subproblem_idx &gt;&gt; remaining_depth) + size_t{1}) &lt;&lt; remaining_depth;
+//ENR CODE -- begin (bug fix): `meet` is load/compare/store, not an atomic max ...
+// while(grid_data-&gt;next_subproblem.meet(ZLB&lt;size_t, bt::local_memory&gt;(next_subproblem_idx))) {}
+grid_data-&gt;next_subproblem.atomic().fetch_max(next_subproblem_idx, cuda::memory_order_relaxed);
+//ENR CODE -- end</code></pre>
+<p>Context (upstream step E): a dive that fails at depth <code>d</code> &lt; <code>subproblems_power</code> proves the whole subtree of 2<sup>remaining_depth</sup> indices empty, so the counter is pushed to the first index after it. <code>ZLB::meet</code> on <code>atomic_memory_grid</code> is a load, a compare and a store; between them other blocks can <code>atomic()++</code> the counter past <code>next_subproblem_idx</code>, and the store then moves it <em>back</em>: indices are handed out twice (duplicated work, and double-counted <code>eps_solved_subproblems</code>). <code>fetch_max</code> is one atomic RMW, monotone. Found while verifying <code>enr_tree_nodes</code> (§11): duplicates showed up as <code>enr_tree_nodes</code> &gt; 2&middot;n!&minus;1 on pigeonhole.</p>
+
+<h2>5. ENR CODE &mdash; restart options</h2>
+<table>
+<tr><th>flag</th><th>field (<span class="ln">config.hpp:50-51</span>)</th><th>default</th><th>meaning</th></tr>
+<tr><td><code>-restart P</code></td><td><code>enr_restart_idle_pct</code> (size_t)</td><td>0 (off)</td><td>restart when &lceil;P&middot;B/100&rceil; blocks are idle (at least 1).</td></tr>
+<tr><td><code>-restart_each_block</code></td><td><code>enr_restart_each_block</code> (bool)</td><td>off</td><td>restart as soon as the first block is idle (threshold = 1 block, whatever P). Enables the restart by itself.</td></tr>
+</table>
+<p>Removed on 2026-11-23 (simplification): <code>-restart_min_ms</code> (minimum round duration, default was 1000 ms), <code>-restart_max</code> (maximum number of restarts) and <code>-restart_subfactor</code>. A round after a restart now has at least T = <code>subproblems_factor</code>&middot;B subproblems, i.e. the upstream <code>-subfactor</code> (default 30, same value as before). Behaviour change: before, the default 1000 ms minimum delayed the first restart; now a restart can happen as soon as the threshold is reached.</p>
+<p>Helper <code>Configuration::enr_restart_on()</code> (<span class="ln">config.hpp:214-215</span>) = <code>enr_restart_idle_pct &gt; 0 || enr_restart_each_block</code>; it replaces every former <code>enr_restart_idle_pct &gt; 0</code> test (GridData ctor, memory estimate, cooperative check, launch). Plumbing: default ctor <span class="ln">config.hpp:79</span>, copy ctor <span class="ln">:130</span>, assignment <span class="ln">:160</span>; parsing <span class="ln">config.cpp:140-141</span> (<code>read_size_t("-restart")</code>, <code>read_bool("-restart_each_block")</code>); usage text <span class="ln">config.cpp:31-32</span>; printed as <code>mzn-stat</code> (<code>enr_restart_idle_pct</code>, <code>enr_restart_each_block="yes|no"</code>) only if the restart is on (<span class="ln">config.hpp:258-261</span>, <span class="stats">STATS</span>). <code>configure_gpu_barebones</code> turns both off if a cooperative launch is impossible (§7).</p>
+
+<h2 class="pb">6. ENR CODE &mdash; restart: data structures</h2>
+<h3>6.1 <code>EnrFrontierItem</code> (<span class="ln">barebones:99-103</span>) &mdash; one open node, 8 bytes</h3>
+<pre><code>struct EnrFrontierItem {
+  int snap;              // block whose snapshot holds the path (blockIdx of the block that left the node)
+  unsigned int k : 31;   // level in that path
+  unsigned int c : 1;    // child of decision k: 0 = children[0] (left), 1 = children[1] (right)
+};</code></pre>
+<p>The open node is: snapshot root store of block <code>snap</code>, then the decisions <code>enr_snap_dec[0..k)</code> with their <em>current</em> child, then child <code>c</code> of decision <code>k</code>. This is the same representation the upstream backtrack uses (root store + re-apply path), so the rebuild (§8.3) is the backtrack code with a different source. <code>enr_restart_now_ns()</code> (<span class="ln">:90-93</span>, <span class="stats">STATS</span>: only used for the restart times) = <code>system_clock</code> (globaltimer) in ns, same clock on all SMs.</p>
+
+<h3>6.2 Fields added to <code>BlockData</code></h3>
+<table>
+<tr><th>field</th><th>line</th><th>kind</th><th>role</th></tr>
+<tr><td><code>enr_snap_store</code> (global <code>VStore</code>)</td><td>191</td><td class="code">CODE</td><td>the block's <b>subroot</b>: copy of <code>root_store</code> taken at harvest. Read-only during the next round: any block rebuilds this block's items from it.</td></tr>
+<tr><td><code>enr_snap_dec</code> (<code>bt::vector&lt;LightBranch&gt;</code>)</td><td>192</td><td class="code">CODE</td><td>the path subroot &rarr; current node: copy of <code>decisions[0..depth)</code>, only the fields C&prime; reads: <code>var</code>, <code>children[2]</code>, <code>current_idx</code> (<code>ropes</code> are not copied: the rebuilt node starts a new decision stack).</td></tr>
+<tr><td><code>enr_snap_root_strategy</code></td><td>193</td><td class="code">CODE</td><td>copy of <code>snapshot_root_strategy</code> (index into <code>GridData::strategies</code> at the subroot), restored after the rebuild like a backtrack does. Keeps the model's search order: at a subroot it is &ge; 1 when an EPS strategy exists (F skips strategy 0), and larger if the first <code>seq_search</code> strategies are already fully assigned. <code>next_unassigned_var</code> is not kept: it stays 0 (step C) and the split skips the assigned variables (only a longer scan for INPUT_ORDER).</td></tr>
+<tr><td><code>enr_in_tree</code></td><td>200</td><td class="stats">STATS</td><td>the next <code>propagate()</code> visits a node not visited before (for <code>enr_tree_nodes</code>).</td></tr>
+<tr><td><code>enr_wait_from/to[256]</code>, <code>enr_n_waits</code>, <code>enr_wait_ns</code>, <code>enr_wait_begin</code></td><td>178-183</td><td class="stats">STATS</td><td>barrier wait intervals (S1 arrival &rarr; S3 exit) for idle accounting.</td></tr>
+</table>
+<p><code>enr_allocate_snapshot()</code> (<span class="ln">:212-217</span>, called at <span class="ln">:842</span> only if <code>enr_restart_enabled</code>): thread 0 allocates <code>enr_snap_store</code> as a copy of the global root store and resizes <code>enr_snap_dec</code> to <code>decisions.size()</code> (5000 initially).</p>
+
+<h3>6.3 Fields added to <code>GridData</code> (<span class="ln">barebones:508-529</span>, ctor <span class="ln">531-558</span>)</h3>
+<table>
+<tr><th>field</th><th>kind</th><th>init</th><th>written by</th><th>read by</th></tr>
+<tr><td><code>enr_restart_enabled</code></td><td class="code">CODE</td><td><code>enr_restart_idle_pct &gt; 0</code></td><td>ctor</td><td>everyone (uniform branch)</td></tr>
+<tr><td><code>enr_restart_threshold</code></td><td class="code">CODE</td><td>1 with <code>-restart_each_block</code>, else &lceil;P&middot;B/100&rceil;, &ge;1</td><td>ctor</td><td>the idle block before S1</td></tr>
+<tr><td><code>enr_restart_target</code> T</td><td class="code">CODE</td><td><code>subproblems_factor&middot;B</code></td><td>ctor</td><td>split depth after S3</td></tr>
+<tr><td><code>enr_items_per_block</code></td><td class="code">CODE</td><td>1024</td><td>ctor</td><td>harvest quota</td></tr>
+<tr><td><code>enr_items</code> (<code>bt::vector&lt;EnrFrontierItem&gt;</code>)</td><td class="code">CODE</td><td>size B&middot;1024 (0 if off)</td><td>harvest (each block its own range)</td><td>rebuild C'</td></tr>
+<tr><td><code>enr_restart_flag</code> (atomic int)</td><td class="code">CODE</td><td>0</td><td>store 1 by the idle block whose <code>fetch_add</code> reaches the threshold; store 0 in reset_round</td><td>every block in <code>propagate</code>; block 0 in reset_round</td></tr>
+<tr><td><code>enr_idle_blocks</code> (atomic int)</td><td class="code">CODE</td><td>0</td><td><code>fetch_add</code> before S1; store 0 in reset_round</td><td>the same <code>fetch_add</code> (its return value)</td></tr>
+<tr><td><code>enr_n_items[2]</code> (atomic int)</td><td class="code">CODE</td><td>0,0</td><td>harvest <code>fetch_add</code> on <code>[enr_round&amp;1]</code>; reset_round zeroes <code>[(enr_round+1)&amp;1]</code></td><td>everyone after S3</td></tr>
+<tr><td><code>enr_host_stop</code></td><td class="code">CODE</td><td>false</td><td>block 0 between S1 and S3</td><td>everyone after S3</td></tr>
+<tr><td><code>enr_st_restarts</code> (plain, block 0 only), <code>enr_raise_ns</code>, <code>enr_kernel_start_ns</code>, <code>enr_pending_drain_ns</code>, <code>enr_pending_raise_ns</code>, <code>enr_st_items_*</code>, <code>enr_st_subproblems_sum</code>, <code>enr_st_s_max</code>, <code>enr_st_truncated</code>, <code>enr_st_drain_*</code>, <code>enr_st_first/last_ns</code></td><td class="stats">STATS</td><td>0 / &minus;1</td><td>CAS winner, block 0</td><td><code>reduce_blocks</code></td></tr>
+</table>
+<p>Upstream fields that the restart reuses: <code>next_subproblem</code> (ZLB counter, reset to B each round), <code>appx_best_bound</code> (repaired exactly each round), <code>blocks</code> (to reach other blocks' snapshots).</p>
+
+<h3>6.4 Block-shared state in the kernel (<span class="ln">barebones:879-892</span>)</h3>
+<table>
+<tr><th><code>__shared__</code></th><th>meaning</th></tr>
+<tr><td><code>bool enr_restart</code></td><td>this block saw the grid flag (set by thread 0 in <code>propagate</code>), cleared after S3.</td></tr>
+<tr><td><code>bool enr_open_subproblem</code></td><td>this block left its subproblem because of the restart and it is not finished &rArr; must harvest.</td></tr>
+<tr><td><code>int enr_s_bits</code></td><td>split depth s of the round. Index <code>idx</code> = item <code>idx &gt;&gt; s</code> + dive bits (low s bits). Round 0: <code>subproblems_power</code>.</td></tr>
+<tr><td><code>size_t num_subproblems</code></td><td>indices in the round: round 0 = 2<sup>subproblems_power</sup> (was a local in upstream), later n&middot;2<sup>s</sup>.</td></tr>
+<tr><td><code>EnrFrontierItem enr_cur_item</code></td><td>item being rebuilt (broadcast from thread 0).</td></tr>
+<tr><td><code>int enr_round</code> (register)</td><td>barriers passed; same value in every block (all pass the same grid.syncs).</td></tr>
+</table>
+
+<h2 class="pb">7. ENR CODE &mdash; restart: host side</h2>
+<h3>7.1 Memory estimate (<span class="ln">barebones:719-721</span>)</h3>
+<p><code>mem_per_block += store_bytes + sizeof(LightBranch)&middot;MAX_SEARCH_DEPTH + sizeof(EnrFrontierItem)&middot;1024</code> (snapshot store, snapshot stack, item quota). This reduces <code>num_blocks</code> through the upstream <code>mem_for_blocks / mem_per_block</code> rule if memory is tight.</p>
+<h3>7.2 Cooperative-launch check (<span class="ln">barebones:766-785</span>)</h3>
+<p><code>grid.sync()</code> is only legal in a cooperative launch where all blocks are co-resident. After upstream has chosen <code>mem_config</code>: query <code>cudaDevAttrCooperativeLaunch</code> and <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor(kernel, 256 threads, mem_config.shared_bytes)</code>; <code>max_resident = bps &middot; SMs</code>. Unsupported &rArr; warning and <code>enr_restart_idle_pct = 0</code> (restarts disabled, normal path). <code>num_blocks &gt; max_resident</code> &rArr; warning, reduced, <code>num_blocks</code> re-printed.</p>
+<h3>7.3 Launch (<span class="ln">barebones:616-630</span>)</h3>
+<pre><code>if(cp.config.enr_restart_idle_pct &gt; 0) {         // cooperative launch, required by grid.sync()
+  void* kernel_args[] = { &amp;ud_ptr, &amp;gd_ptr };
+  CUDAEX(cudaLaunchCooperativeKernel((void*) gpu_barebones_solve, dim3(B), dim3(CUDA_THREADS_PER_BLOCK),
+                                     kernel_args, mem_config.shared_bytes, 0));
+} else {
+  gpu_barebones_solve&lt;&lt;&lt;B, CUDA_THREADS_PER_BLOCK, mem_config.shared_bytes&gt;&gt;&gt;(...);   // upstream
+}</code></pre>
+<p>The host loop that polls the kernel and sets <code>unified_data-&gt;stop</code> on timeout/CTRL-C is unchanged.</p>
+
+<h2>8. ENR CODE &mdash; restart: the kernel, step by step</h2>
+<p>Upstream structure of <code>gpu_barebones_solve</code>: A (allocate) &rarr; B loop <code>while(idx &lt; num_subproblems &amp;&amp; !stop)</code> { C copy global root &rarr; D dive <code>subproblems_power</code> levels following the bits of idx &rarr; E skip if the dive failed | F DFS of the subproblem (I bound, II propagate, III split, IV backtrack) &rarr; G <code>idx = next_subproblem++</code> } &rarr; end (stats, best solution). The restart wraps B..G in a round loop and changes C, D and the end of F.</p>
+
+<svg width="100%" viewBox="0 0 760 250" style="break-inside:avoid; margin:4px 0">
+<style>.t{font-size:10px}.s{font-size:9px;fill:#444}.b{fill:#e3e9f3;stroke:#2a5db0}.g{fill:#eef6ee;stroke:#2e8b4a}.y{fill:#fff4d6;stroke:#d99a00}.r{stroke:#b00;stroke-width:2}</style>
+<text x="6" y="14" class="t" font-weight="bold">One round with a restart (time &rarr;), 4 blocks</text>
+<text x="6" y="44" class="t">block 0</text><text x="6" y="74" class="t">block 1</text><text x="6" y="104" class="t">block 2</text><text x="6" y="134" class="t">block 3</text>
+<rect x="60" y="32" width="330" height="18" class="b"/><text x="66" y="45" class="s">busy: subproblems from the counter</text>
+<rect x="60" y="62" width="160" height="18" class="b"/><rect x="220" y="62" width="170" height="18" class="y"/><text x="226" y="75" class="s">idle: enr_idle_blocks++, waits at S1</text>
+<rect x="60" y="92" width="200" height="18" class="b"/><rect x="260" y="92" width="130" height="18" class="y"/><text x="266" y="105" class="s">idle, waits at S1</text>
+<rect x="60" y="122" width="330" height="18" class="b"/><text x="66" y="135" class="s">busy</text>
+<line x1="330" y1="24" x2="330" y2="150" stroke="#b00" stroke-dasharray="3,2"/><text x="270" y="162" class="s" fill="#b00">flag raised by the idle block that reaches the threshold</text><text x="270" y="172" class="s" fill="#b00">(-restart_each_block: the first idle block)</text>
+<line x1="390" y1="24" x2="390" y2="150" class="r"/><text x="380" y="186" class="t" font-weight="bold">S1</text>
+<text x="335" y="200" class="s">busy blocks finish their node (drain)</text>
+<rect x="392" y="32" width="90" height="18" class="g"/><text x="396" y="45" class="s">harvest+reset</text>
+<rect x="392" y="62" width="90" height="18" fill="#fff" stroke="#bbb"/>
+<rect x="392" y="92" width="90" height="18" fill="#fff" stroke="#bbb"/>
+<rect x="392" y="122" width="90" height="18" class="g"/><text x="396" y="135" class="s">harvest</text>
+<line x1="484" y1="24" x2="484" y2="150" class="r"/><text x="475" y="186" class="t" font-weight="bold">S3</text>
+<rect x="488" y="32" width="260" height="18" class="b"/><rect x="488" y="62" width="260" height="18" class="b"/><rect x="488" y="92" width="260" height="18" class="b"/><rect x="488" y="122" width="260" height="18" class="b"/>
+<text x="494" y="45" class="s">round r+1: idx = blockIdx.x, then counter from B</text>
+<text x="494" y="75" class="s">C': rebuild item idx&gt;&gt;s from snapshot</text>
+<text x="494" y="105" class="s">D: dive s levels on the low bits</text>
+<text x="494" y="135" class="s">F: DFS of the subproblem</text>
+<text x="6" y="222" class="s">S1: all blocks stopped; stacks, root_store, best_bound frozen. Between S1 and S3: harvesting blocks write their own snapshot + own range of items + enr_n_items[r&amp;1];</text>
+<text x="6" y="235" class="s">block 0 thread 0 writes every shared field of the next round (reset_round). No two writers on one location, no reader of what is being written. S3: everything visible.</text>
+</svg>
+
+<h3>8.1 Round-loop head (<span class="ln">barebones:877-893</span>)</h3>
+<p>Thread 0 initialises the shared variables (<code>enr_s_bits = subproblems_power</code>, <code>num_subproblems = eps_num_subproblems</code>); block 0 records <code>enr_kernel_start_ns</code> (STATS). <code>enr_round = 0</code>; <code>while(true) {</code> encloses the upstream subproblem loop. The subproblem loop condition stays <code>idx &lt; num_subproblems &amp;&amp; !stop</code> (no <code>!enr_restart</code>): the flag is only raised when blocks are idle, which happens only when the counter is exhausted, so any block that reaches G after the flag gets an index &ge; <code>num_subproblems</code> and leaves.</p>
+
+<h3>8.2 Step C (<span class="ln">barebones:911-914</span>)</h3>
+<p>Round 0: upstream copy of the global root (<code>unified_data-&gt;root.store-&gt;copy_to</code>). Later rounds: C'.</p>
+
+<h3>8.3 Step C' &mdash; rebuild an item (<span class="ln">barebones:915-948</span>)</h3>
+<pre><code>enr_cur_item = enr_items[subproblem_idx &gt;&gt; enr_s_bits];                 // thread 0, then __syncthreads
+const BlockData&amp; src = blocks[enr_cur_item.snap];
+src.enr_snap_store-&gt;copy_to(group, *block_data.store);          // root store of the source block
+while(has_changed) {                                         // block-parallel re-embed, until stable
+  for(i = threadIdx.x; i &lt; k; i += blockDim.x)
+    has_changed |= store-&gt;embed(src.enr_snap_dec[i].var, src.enr_snap_dec[i].current());
+}
+store-&gt;embed(src.enr_snap_dec[k].var, src.enr_snap_dec[k].children[c]);   // thread 0
+current_strategy = src.enr_snap_root_strategy;                          // next_unassigned_var stays 0 (step C)</code></pre>
+<p>This is a copy of the upstream backtrack (step IV, <span class="ln">:1146-1175</span>) where <code>decisions</code>, <code>root_store</code> (the subroot), <code>snapshot_root_strategy</code> are those of the source block, and the last level takes child <code>c</code> instead of <code>next()</code>. No propagation here: the rebuilt node is propagated by the first dive <code>propagate()</code> (D) or, if s = 0, by the first F iteration. <code>depth</code> is reset to 0 (upstream line before C): the rebuilt node becomes the root of a new subproblem, its own <code>root_store</code> is taken at F-III depth 0 as upstream does.</p>
+
+<h3>8.4 Step D &mdash; dive (<span class="ln">barebones:958</span>)</h3>
+<p><code>remaining_depth = enr_s_bits</code> (was <code>config.subproblems_power</code>). The dive follows the low s bits of idx below the rebuilt node, exactly as upstream follows the bits below the global root. Step E (skip of a failed dive) is unchanged except for the race fix (§4); it is offset-relative: <code>((idx &gt;&gt; d) + 1) &lt;&lt; d</code> with d &le; s stays inside the same item because indices of one item are aligned on 2<sup>s</sup>.</p>
+
+<h3>8.5 End of the F body: stop on restart (<span class="ln">barebones:1190-1200</span>)</h3>
+<pre><code>if(enr_restart) { if(threadIdx.x == 0) enr_open_subproblem = !stop; __syncthreads(); break; }</code></pre>
+<p>Placed at the <em>end</em> of the <code>while(!stop)</code> body, after III (split + embed of the left decision) or IV (backtrack: restore + embed of the right decision). So: <code>root_store</code> already exists (taken at depth 0 in III), the current node is embedded but not propagated &rArr; it is unexplored and becomes an item; nothing is lost and nothing is explored twice. The two upstream <code>break</code>s inside IV (leaf at depth 0, rope = &minus;1) are before this check: if the subproblem is finished, <code>enr_open_subproblem</code> stays false. <code>enr_open_subproblem = !stop</code>: if the timeout hit at the same time, nothing is harvested.</p>
+<p>Solved-subproblem guard (<span class="ln">:1203</span>): <code>&amp;&amp; !enr_open_subproblem</code> so an interrupted subproblem is not counted in <code>eps_solved_subproblems</code>.</p>
+
+<h3>8.6 End of a round (<span class="ln">barebones:1224-1384</span>)</h3>
+<p><b>Off-path</b> (<span class="ln">:1226-1228</span>): <code>if(!enr_restart_enabled) break;</code> &mdash; uniform, the kernel ends exactly as upstream.</p>
+<p><b>Before S1</b> (<span class="ln">:1231-1245</span>): thread 0: a block that left the loop without <code>stop</code> and without <code>enr_restart</code> ran out of indices &rArr; <code>idle = enr_idle_blocks.fetch_add(1) + 1</code>; if <code>idle == enr_restart_threshold</code> this block raises the flag (<code>enr_restart_flag.store(1)</code>). <code>fetch_add</code> returns a different value to every caller, so exactly one block raises it. (STATS: phase charge, <code>enr_wait_begin</code>.)</p>
+<p><b>S1</b> <code>grid.sync()</code> (<span class="ln">:1247</span>), then <code>++enr_round</code>. Idle blocks wait here until every busy block has seen the flag and finished its current node.</p>
+<p><b>Harvest</b> (<span class="ln">:1250-1304</span>, only if <code>enr_open_subproblem</code>):</p>
+<ol>
+<li><code>enr_snap_dec.resize(decisions.size())</code> if <code>decisions</code> grew (push_decision doubles it). Device <code>malloc</code> inside the kernel.</li>
+<li>Copy <code>root_store &rarr; enr_snap_store</code> (block-parallel) and <code>decisions[0..depth) &rarr; enr_snap_dec</code> field by field (var, children[0..1], current_idx; not the ropes).</li>
+<li>Thread 0: <code>enr_snap_root_strategy</code>.</li>
+<li>Open nodes (if <code>depth &ge; 1</code>): one item <code>(k, 1)</code> for every level k &lt; depth with <code>current_idx == 0</code> (right branch never started), plus the current node <code>(depth&minus;1, decisions[depth&minus;1].current_idx)</code>. After a split the current node is <code>(depth&minus;1, 0)</code> and level depth&minus;1 also yields <code>(depth&minus;1, 1)</code>; after a backtrack it is <code>(depth&minus;1, 1)</code>.</li>
+<li>Quota (<span class="ln">:1278-1287</span>): if <code>pending + 1 &gt; enr_items_per_block</code> (1024): keep the <code>1023</code> shallowest pending right branches, and replace everything deeper by the <em>left</em> child of the last kept level (<code>last_k</code>): complete but re-explores refuted parts. <code>enr_st_truncated++</code> (STATS). Observed in the MeluXina MZN 2024 series: 2 blocks in <code>network_50_cstr/toy_network_1000_m</code> (job 5476403) and 1 block in <code>graph-clear/planar_n20_seed2022_15</code> (job 5477197), both with <code>-restart 10</code> and 216 blocks.</li>
+<li>Reserve <code>m = keep + 1</code> slots with one <code>enr_n_items[enr_round&amp;1].fetch_add(m)</code>, write the items in order of increasing k (shallow first), the current node last.</li>
+</ol>
+<p><b>reset_round</b> (<span class="ln">:1306-1332</span>, block 0 thread 0, in parallel with the harvests):</p>
+<ol>
+<li>exact best bound: <code>appx_best_bound.meet(blocks[b].best_bound)</code> for all b (all blocks are stopped, so the minimum is exact; repairs the lost-update race of the racy <code>meet</code> in <code>propagate</code>).</li>
+<li><code>enr_host_stop = unified_data-&gt;stop.test()</code>, read once so every block takes the same decision after S3. (STATS: drain time = now &minus; <code>enr_raise_ns</code> if the flag is up.)</li>
+<li><code>next_subproblem = B</code> (a plain store: blocks 0..B&minus;1 start on their own index).</li>
+<li>&ndash;5. <code>enr_idle_blocks = 0</code>, <code>enr_restart_flag = 0</code>.</li>
+<li value="6"><code>enr_n_items[(enr_round+1)&amp;1] = 0</code>: the counter of the <em>next</em> restart (the current one is being filled now and read after S3).</li>
+</ol>
+<p><b>S3</b> <code>grid.sync()</code> (<span class="ln">:1334</span>). (There is no S2: dropped in design rev. 3; it would only be needed for sorting items or per-item split depth.)</p>
+<p><b>Plan the next round</b> (<span class="ln">:1336-1381</span>): every block reads <code>n = enr_n_items[enr_round&amp;1]</code>; <code>finished = enr_host_stop || n == 0</code> (uniform). If not finished, thread 0: smallest s with <code>n&middot;2<sup>s</sup> &ge; T</code> (capped at 40), <code>enr_s_bits = s</code>, <code>num_subproblems = n&lt;&lt;s</code>, clears <code>enr_restart</code>/<code>enr_open_subproblem</code>, <code>subproblem_idx = blockIdx.x</code>; block 0 updates the STATS (<code>enr_st_restarts</code>, <code>enr_st_items_*</code>, ...). Then <code>__syncthreads(); if(finished) break;</code> and the round loop restarts at the subproblem loop.</p>
+<p>Termination: a round with n = 0 means no block had an open subproblem, i.e. every block finished all its work &rArr; the search is complete. All blocks leave the round loop at the same barrier, so <code>num_blocks_done</code> etc. at <span class="ln">:1386-</span> run as upstream.</p>
+
+<h2>9. ENR CODE &mdash; trigger: raise (idle block) and poll (<code>propagate()</code>)</h2>
+<p><b>Raise</b> (end of a round, before S1, <span class="ln">:1232-1241</span>):</p>
+<pre><code>if(!stop &amp;&amp; !enr_restart) {                                  // this block is idle
+  int idle = grid_data-&gt;enr_idle_blocks.fetch_add(1) + 1;
+  if(idle == grid_data-&gt;enr_restart_threshold) {             // 1 with -restart_each_block
+    grid_data-&gt;enr_restart_flag.store(1);
+    grid_data-&gt;enr_raise_ns = enr_restart_now_ns();          // STATS
+  }
+}</code></pre>
+<p><b>Poll</b>: <code>propagate()</code> gets <code>bool&amp; enr_restart</code> (<span class="ln">:567-568</span>, <span class="ln">:1427-1428</span>; calls <span class="ln">:976</span>, <span class="ln">:1087</span>). Inside the thread-0 block after the node counters:</p>
+<pre><code>// node limit (-cutnodes): with restarts every block must leave the round loop together   (:1566-1567)
+if(nodes &gt;= stop_after_n_nodes || stop.test()) { ...; stop = true;
+  if(grid_data.enr_restart_enabled) unified_data.stop.test_and_set(); }
+// poll                                                                                   (:1570-1574)
+if(enr_restart_enabled &amp;&amp; !enr_restart &amp;&amp; enr_restart_flag.load() != 0) enr_restart = true;</code></pre>
+<p>Before the simplification the flag was raised by a <em>busy</em> block inside <code>propagate()</code> (CAS 0&rarr;1 after checking the idle count, the round age for <code>-restart_min_ms</code> and the restart count for <code>-restart_max</code>), because an idle block waiting at S1 cannot re-check a time condition later. Without these two options the condition is only "the idle count reaches the threshold", which is known exactly at the moment an idle block increments it, so the idle block raises the flag itself. Cost per node: one relaxed load. A dive node also polls; the dive continues to its end and the stop happens at the end of the first F iteration (or the block leaves at G if the dive failed). If every block is idle (no busy block left), the flag is raised but n = 0 after S3 and the kernel ends.</p>
+<p>Why <code>test_and_set</code> on the node limit: without it, the block that hits <code>-n</code> would go to S1 while the others keep searching until the counter is empty; upstream's per-block stop has no meaning when all blocks must meet at the barrier.</p>
+
+<h2 class="pb">10. Correctness arguments to check</h2>
+<ul>
+<li><b>Frontier partition</b> (RESTART_GRIDSYNC.pdf rev. 5, Prop. 1, ~ Lecoutre nld-nogoods): the unexplored part of a DFS stopped at a node = the right siblings never started along the path (<code>current_idx == 0</code>) + the current unpropagated node. Ropes do not add levels: a level with <code>current_idx == 1</code> is in its right branch, nothing pending there; levels deeper than <code>depth</code> are dead after a backtrack.</li>
+<li><b>Dyadic alignment</b> (Prop. 2): item j owns indices <code>[j&middot;2<sup>s</sup>, (j+1)&middot;2<sup>s</sup>)</code>; D and E work on the low bits, so a skip never crosses into another item.</li>
+<li><b>One-writer rule between S1 and S3</b>: harvest writes own <code>enr_snap_*</code>, own <code>enr_items</code> range, <code>enr_n_items[r&amp;1]</code> (atomic); reset_round writes the other shared fields and <code>enr_n_items[(r+1)&amp;1]</code>; nobody reads what another writes before S3. Snapshots are read-only during the round they serve; the next harvest overwrites them only after S1, when nobody rebuilds.</li>
+<li><b>Single snapshot buffer suffices</b>: rebuild (C') is not interruptible (the flag is tested only at the end of F's body), so no block reads snapshot r while snapshot r+1 is written.</li>
+<li><b>Bound</b>: the exact meet in reset_round makes <code>appx_best_bound</code> exact at every round start.</li>
+<li><b>Verified after removing the <code>ropes</code> copy and <code>enr_snap_root_next_unassigned_var</code></b> (2026-11-23): php8/9/10 <code>enr_tree_nodes</code> again 80639 / 725759 / 7257599 in the three modes, all UNSAT; <code>enr_small</code> 12/12; 98 registers. <li><b>Verified after the simplification</b> (2026-11-23, RTX 4050, 40 blocks): php8/9/10 (UNSAT, generated FlatZinc, input order) <code>enr_tree_nodes</code> = 80639 / 725759 / 7257599 = 2&middot;n!&minus;1 with no restart, <code>-restart 10</code> and <code>-restart_each_block</code>; php10 7.66 s &rarr; 2.25 s (<code>-restart 10</code>) / 2.27 s (<code>-restart_each_block</code>), 7 restarts, idle 71.9 % &rarr; 0.1 %; <code>benchmarks/enr_small</code> 12/12; solve kernel 98 registers. <b>Verified before</b> (11-17/18): php8/9/10 (UNSAT) <code>enr_tree_nodes = 2&middot;n!&minus;1</code> identical with/without restarts (15/15 runs); <code>benchmarks/enr_small</code> 12/12 both modes; php10 7.7 s &rarr; 2.4 s, golomb10 13.9 s &rarr; 5.9 s (<code>-restart 3..10 -restart_min_ms 0</code>). Kernel 98 registers, no spills (at implementation time).</li>
+</ul>
+
+<h2>11. ENR STATS &mdash; restart statistics</h2>
+<h3>11.1 <code>enr_tree_nodes</code> / <code>enr_tree_failures</code></h3>
+<p>Goal: count each node of the search tree once, whatever the decomposition, so runs with and without restarts are comparable (<code>nodes</code> counts dive nodes repeatedly: every index re-dives the shared prefix).</p>
+<ul>
+<li>Dive: before each dive <code>propagate</code> (<span class="ln">:974-975</span>) <code>enr_in_tree = (idx &amp; (2<sup>remaining_depth</sup>&minus;1)) == 0</code>: the node at that depth is shared by all indices with the same high bits; only the smallest (low bits 0) counts it.</li>
+<li>DFS (F): <code>enr_in_tree = true</code> (<span class="ln">:1057</span>): every DFS node is visited once.</li>
+<li><code>propagate</code> (<span class="ln">:1553-1556</span>): if <code>enr_in_tree</code>, <code>enr_tree_nodes++</code>, <code>enr_tree_fails += is_bot</code>.</li>
+<li>Summed in <code>Statistics::meet</code> (<span class="ln">statistics.hpp:328</span>); printed by <code>print_enr_restart_statistics</code> (<span class="ln">:495-515</span>) as <code>enr_tree_nodes</code>, <code>enr_tree_failures</code>, <code>enr_redundant_dive_nodes = nodes &minus; enr_tree_nodes</code> (printed whenever enr_tree_nodes &gt; 0, also without <code>-restart</code>).</li>
+</ul>
+<p class="small">Why it is exact for satisfaction/UNSAT: the counter is monotone (after the <code>fetch_max</code> fix), so among indices sharing a dive prefix the one with low bits 0 is always handed out first, and with deterministic propagation it reaches every shared node the others reach. With optimisation, propagation of a dive node depends on <code>appx_best_bound</code> at that moment: the low-bits-0 index can fail at a shallower node (stronger bound) while another index of the same prefix, which propagated earlier with a weaker bound, went deeper; those deeper nodes are then counted by nobody, and <code>enr_tree_nodes</code> is slightly low. Verified exact on php (UNSAT); treat it as approximate on optimisation instances.</p>
+
+<h3>11.2 Restart counters (<span class="ln">statistics.hpp:141-159</span>, <span class="ln">212-230</span>)</h3>
+<table>
+<tr><th>printed</th><th>source</th></tr>
+<tr><td><code>enr_restarts</code></td><td><code>enr_st_restarts</code>: rounds started with n &gt; 0.</td></tr>
+<tr><td><code>enr_restart_items_sum/max/last</code></td><td>n at each restart (after S3, block 0).</td></tr>
+<tr><td><code>enr_restart_subproblems_sum</code></td><td>&Sigma; n&middot;2<sup>s</sup>.</td></tr>
+<tr><td><code>enr_restart_s_max</code></td><td>largest s.</td></tr>
+<tr><td><code>enr_restart_truncated_blocks</code></td><td>harvests that hit the 1024 quota.</td></tr>
+<tr><td><code>enr_restart_drain_ms_avg/max</code></td><td>flag raised (<code>enr_raise_ns</code>) &rarr; block 0 between S1 and S3 (<code>enr_pending_drain_ns</code>).</td></tr>
+<tr><td><code>enr_restart_first_sec</code>, <code>enr_restart_last_sec</code></td><td><code>enr_raise_ns &minus; enr_kernel_start_ns</code> of the first / last restart.</td></tr>
+</table>
+<p>Copied from <code>GridData</code> to <code>root.stats</code> in <code>reduce_blocks</code> (<span class="ln">barebones:1589-1602</span>), not via <code>meet</code>. <code>enr_restart_reset/enr_restart_copy</code> in the Statistics ctors.</p>
+<h3>11.3 Barrier waits as idle time</h3>
+<p>Each block records <code>[S1 arrival, S3 exit)</code> (<span class="ln">:1244</span>, <span class="ln">:1339-1347</span>), up to 256 intervals (+ total <code>enr_wait_ns</code>). <code>reduce_blocks</code> adds <code>enr_wait_ns</code> to <code>enr_idle_ns_sum</code> (<span class="ln">:1621</span>) and, for the 20-slice timeline, adds the overlap of each wait with the slice to idle and does not count a block waiting at the slice end as busy (<span class="ln">:1643-1655</span>). After S3, <code>enr_ph_t</code> and <code>block_data.timer</code> are set to now so the wait is not charged to any phase or upstream timer; <code>enr_after_restore = false</code> since an interrupted backtrack has no following fixpoint.</p>
+<p class="w">With restarts every block lives until the kernel end, so upstream's <code>first_block_idle_time</code> (= block lifetime) no longer measures idleness; use <code>enr_pct_idle</code> / the timeline, which include the barrier waits.</p>
+
+<h2 class="pb">12. ENR STATS &mdash; profiling instrumentation (committed in 401ff93)</h2>
+<h3>12.1 Phases: <code>ENR_PH</code> (<span class="ln">barebones:801-808</span>)</h3>
+<pre><code>#define ENR_PH(P, NOW, CNT) if(threadIdx.x == 0) {
+  enr_ph_ns[P] += NOW - enr_ph_t;  enr_ph_cnt[P] += CNT;  enr_ph_t = NOW; }</code></pre>
+<p>A chain of contiguous charges from <code>start_time</code> (<code>enr_ph_t</code> initialised at <span class="ln">:871</span>) to the block's end: the 8 phases sum to the block lifetime, and with idle (longest lifetime &minus; own lifetime + barrier waits) to 100 % of B &times; kernel time. Enum <code>EnrPhase</code> (<span class="ln">statistics.hpp:183-193</span>):</p>
+<table>
+<tr><th>phase</th><th>charged at</th><th>covers</th></tr>
+<tr><td>PH_SUBPB_SWITCH</td><td><span class="ln">:963</span>, <span class="ln">:1243</span>, <span class="ln">:1391</span></td><td>G + loop head + C/C' ; cnt = dives. Also round end &rarr; barrier, and end &rarr; exit.</td></tr>
+<tr><td>PH_DIVE_FP</td><td><span class="ln">:978</span></td><td>whole <code>propagate()</code> of a dive node</td></tr>
+<tr><td>PH_DIVE_BRANCH</td><td><span class="ln">:973</span>, <span class="ln">:1012</span></td><td>split + commit during the dive</td></tr>
+<tr><td>PH_SEARCH_FP / PH_BT_FP</td><td><span class="ln">:1089-1090</span></td><td><code>propagate()</code> of a node reached going down / reached by a backtrack (<code>enr_bt</code> read before the call)</td></tr>
+<tr><td>PH_SEARCH_BRANCH</td><td><span class="ln">:1086</span>, <span class="ln">:1138</span></td><td>bound, root snapshot, split, decision; rope lookup</td></tr>
+<tr><td>PH_BT_RESTORE</td><td><span class="ln">:1156</span></td><td>copy <code>root_store &rarr; store</code></td></tr>
+<tr><td>PH_BT_REDESCEND</td><td><span class="ln">:1177</span></td><td>re-embed path + right branch</td></tr>
+</table>
+<h3>12.2 Per-node fixpoint and backtrack cost</h3>
+<ul>
+<li><code>propagate</code>: <code>enr_fp_start</code> (<span class="ln">:1437</span>) &rarr; after the fixpoint (<span class="ln">:1491-1499</span>) <code>enr_record_node_fp</code> (log2 &micro;s histogram, 16 buckets, max) and either <code>enr_record_backtrack</code> (node after a backtrack: restore+redescend ns, fp ns, path length, histogram of the whole cost) or <code>enr_record_other_node</code>. The <code>enr_rs_*</code> fields it fills are about backtracks, not the load-balancing restart.</li>
+<li>Backtrack (IV): <code>enr_backtracks++</code>, <code>enr_restore_start</code> (<span class="ln">:1139-1142</span>); new upstream-style timer <code>Timer::BACKTRACK_ENR</code> (<span class="ln">statistics.hpp:27</span>) via <code>TIMEPOINT</code> (<span class="ln">:1176</span>); <code>enr_restore_ns</code>, <code>enr_restore_path</code>, <code>enr_after_restore = true</code> (<span class="ln">:1178-1182</span>).</li>
+<li><code>auto enr_dive_end = stop_timer(DIVE, ...)</code> (<span class="ln">:1011</span>): was a plain call, now the return value feeds <code>ENR_PH</code>.</li>
+</ul>
+<h3>12.3 Cross-block load balance and timeline (<code>reduce_blocks</code>, <span class="ln">:1603-1659</span>)</h3>
+<p>min/max nodes, subproblems, lifetime over blocks; <code>enr_idle_ns_sum</code>; blocks done (<code>num_blocks_done == 1</code>) with first/last done time; 20 slices of [0, longest lifetime): per slice the time-weighted % of empty block slots and the number of busy blocks at the slice end.</p>
+<h3>12.4 Output (<code>print_enr_statistics</code>, <span class="ln">statistics.hpp:516-</span>)</h3>
+<p>Sections <code>[kernel]</code>, <code>[phases]</code> (<code>enr_pct_*</code>, check sum = 100), counts/averages (<code>enr_dives</code>, <code>enr_*_fixpoints</code>, <code>enr_*_fixpoint_us_avg</code>), <code>[backtrack]</code> (<code>enr_backtrack_*_us_avg</code> + cost histogram), <code>[kernel] rates and blocks done</code> + idle timeline, <code>[block]</code> (avg/min/max), <code>[node]</code> (avg time + fixpoint histogram). Explained in <code>stats_explained.txt</code>. Also the one-time kernel print <code>% [ENR] local Turbo build running ...</code> (<span class="ln">barebones:831-837</span>).</p>
+
+<h2>13. ENR STATS &mdash; simplification dump/trace, local lala-core</h2>
+<ul>
+<li><code>common_solving.hpp</code>: <code>enr_dump(title)</code> (<span class="ln">:513</span>, <code>ENR_PRINT_CP=1</code>: variables and propagators before/after simplification, called at <span class="ln">:620, :627, :703, :710</span>); <code>enr_level</code>, <code>enr_snapshot</code>, <code>enr_take</code>, <code>enr_report</code>, <code>enr_traced_deduce</code> (<span class="ln">:538-602</span>, <code>ENR_PRINT_CP=2</code>: report of every change per simplification step). The fixpoint lambda (<span class="ln">:648</span>) calls <code>enr_traced_deduce</code> when tracing, else the upstream <code>iprop-&gt;deduce(i)</code> (behaviour identical when the env var is unset).</li>
+<li><code>CMakeLists.txt</code> (<span class="ln">:41-49</span>): option <code>LOCAL_LALA_CORE</code> (ON) &rarr; <code>FetchContent_Declare(lala_core SOURCE_DIR ../lala-core)</code>, a clone of tag v1.2.8.</li>
+<li><code>lala-core/include/lala/fixpoint.hpp:6-7</code>: <code>#define LALA_CORE_LOCAL_ENR 1</code> (marker for the kernel print). <code>simplifier.hpp:262-270</code>: 4 read-only getters (<code>enr_root</code>, <code>enr_is_formula_eliminated</code>, <code>enr_is_variable_eliminated</code>, ...).</li>
+</ul>
+
+<h2 class="pb">14. Review checklist: open points I would look at</h2>
+<table>
+<tr><th style="width:4%">#</th><th style="width:30%">point</th><th>detail</th></tr>
+<tr><td>1</td><td>Item quota hard-coded 3 times</td><td><code>1024</code> appears in <code>enr_items_per_block(1024)</code> and <code>enr_items(B*1024)</code> (<span class="ln">:539-540</span>) and in the memory estimate (<span class="ln">:720</span>). Should be one constant.</td></tr>
+<tr><td>2</td><td>Device <code>malloc</code> in the harvest</td><td><code>enr_snap_dec.resize</code> (<span class="ln">:1254</span>) allocates inside the kernel when <code>decisions</code> grew beyond 5000; no failure check. Only for very deep searches.</td></tr>
+<tr><td>3</td><td>Drain latency</td><td>Idle blocks wait at S1 until every busy block finishes its current node; one very long fixpoint delays all. Measured by <code>enr_restart_drain_ms_*</code>.</td></tr>
+<tr><td>4</td><td>No minimum round length</td><td>With <code>-restart_min_ms</code> gone, a restart is raised as soon as the threshold is reached, even in a very short round. Each round still explores at least one new node per busy block, so the search terminates, but on instances where blocks go idle often there can be many short rounds (cost: 2 grid barriers + harvest each). With <code>-restart_each_block</code> this is the most frequent case.</td></tr>
+<tr><td>5</td><td>Upstream EPS stats across rounds</td><td><code>eps_num_subproblems</code> keeps round 0's 2<sup>power</sup>; <code>eps_solved_subproblems</code> and <code>eps_skipped_subproblems</code> add indices of all rounds (different units). Use <code>enr_restart_subproblems_sum</code> for the later rounds.</td></tr>
+<tr><td>6</td><td><code>enr_tree_nodes</code> on optimisation</td><td>See §11.1: exact when propagation is deterministic (php verified); can be slightly low on optimisation instances because dive nodes depend on the bound at the time.</td></tr>
+<tr><td>7</td><td>Split depth cap</td><td><code>s &lt; 40</code> (<span class="ln">:1353</span>). With <code>-subfactor 0</code>, T = 0, s = 0, rounds can have fewer indices than blocks (harmless: extra blocks are idle).</td></tr>
+<tr><td>8</td><td>Truncation is complete but redundant</td><td>The left child of <code>last_k</code> covers deeper levels including parts already refuted. It happens: <code>enr_restart_truncated_blocks</code> &gt; 0 on 2 MZN 2024 instances (see §8.6). The quota is per block, not pooled: a block with a deep stack cannot use the slots left free by idle blocks.</td></tr>
+<tr><td>9</td><td>Behavioural change without <code>-restart</code></td><td>Only the <code>fetch_max</code> fix (§4) and the heap sizing (§3). Everything else is behind <code>enr_restart_enabled</code>; the extra <code>propagate</code> argument and the <code>__shared__</code> variables are present but unused when off (round loop runs once, <code>break</code> at <span class="ln">:1227</span>).</td></tr>
+<tr><td>10</td><td>Registers / occupancy</td><td>The cooperative check uses <code>mem_config.shared_bytes</code>; the extra <code>__shared__</code> (bools, int, size_t, EnrFrontierItem) are static shared memory included by the occupancy API. If B is reduced, <code>num_blocks</code> is re-printed.</td></tr>
+<tr><td>11</td><td>Stats overhead in the hot path</td><td>ENR_PH reads the clock 2&ndash;3 times per node; per-node histogram updates. Removing ENR STATS will make nodes/s slightly higher; compare runs with the same binary.</td></tr>
+</table>
+
+<h2>15. How to remove the stats / turn the restart off</h2>
+<ul>
+<li><b>Restart off</b>: run without <code>-restart</code> (default). Code path = upstream + §3 + §4.</li>
+<li><b>Remove ENR STATS</b>: delete every line ending in <code>//ENR STATS...</code> and every <code>//ENR STATS -- begin</code> &hellip; <code>-- end</code> block. No line mixes CODE and STATS. The <code>propagate()</code> call sites stay (their tag is CODE), <code>TIMEPOINT(BACKTRACK_ENR)</code> goes with <code>Timer::BACKTRACK_ENR</code>, and in <code>common_solving.hpp:648</code> restore <code>return iprop-&gt;deduce(i);</code>. The local lala-core is optional (<code>-DLOCAL_LALA_CORE=OFF</code>) once <code>enr_*</code> getters are no longer used.</li>
+<li><b>Remove ENR CODE</b> (back to upstream): revert the restart, the <code>fetch_max</code> (keep it, it is a fix) and the heap line.</li>
+</ul>
+<p class="small">Related documents: <code>pdfs/RESTART_GRIDSYNC.pdf</code> (theory + proofs, rev. 5), <code>pdfs/DONATION_DESIGN.pdf</code> (barrier-free alternative, not implemented), <code>stats_explained.txt</code>.</p>
+</body></html>

@@ -506,10 +506,110 @@ public:
     }
   }
 
+  //ENR STATS -- whole function.
+  /** Readable dump of the current problem: one line per variable (name + domain) and one line per ternary propagator.
+   * Only active when the environment variable ENR_PRINT_CP is set:  ENR_PRINT_CP=1 ./build/gpu-release/turbo ...
+   * Called by `preprocess_tcn` before and after the simplification, so the two dumps can be compared. */
+  void enr_dump(const char* title) const {
+    if(std::getenv("ENR_PRINT_CP") == nullptr) { return; }
+#ifndef TURBO_IPC_ABSTRACT_DOMAIN
+    printf("%% [ENR] ===== %s: %d variables, %d propagators, is_bot=%d =====\n",
+      title, (int)store->vars(), (int)iprop->num_deductions(), (int)iprop->is_bot());
+    // Variables: index in the store, name (from the environment `env`), current interval.
+    printf("%% [ENR] variables (index  name  domain):\n");
+    for(int i = 0; i < store->vars(); ++i) {
+      printf("%%   v%-4d %-22s ", i, env.name_of(AVar(store->aty(), i)).data());
+      (*store)[i].print();
+      printf("%s\n", (*store)[i].is_bot() ? "   <-- EMPTY" : "");
+    }
+    // Propagators: each bytecode {op, x, y, z} means  x = y op z  (for comparisons: x = (y op z), x being a 0/1 variable).
+    printf("%% [ENR] propagators (index  x = y op z):\n");
+    for(int i = 0; i < iprop->num_deductions(); ++i) {
+      auto bc = iprop->load_deduce(i);
+      bool cmp = (bc.op == lala::EQ || bc.op == lala::LEQ);
+      printf("%%   p%-4d %s = %s%s %s %s%s%s\n", i,
+        env.name_of(bc.x).data(), cmp ? "(" : "", env.name_of(bc.y).data(),
+        lala::string_of_sig(bc.op), env.name_of(bc.z).data(), cmp ? ")" : "",
+        iprop->ask(i) ? "   [entailed]" : "");
+    }
+#endif
+  }
+
+  //ENR STATS -- begin: step-by-step trace of the simplification, enabled with ENR_PRINT_CP=2.
+  /** Debug level from the environment variable ENR_PRINT_CP (0 if unset). 1 = dumps before/after, 2 = also the trace below. */
+  int enr_level() const {
+    const char* e = std::getenv("ENR_PRINT_CP");
+    return e == nullptr ? 0 : std::atoi(e);
+  }
+
+  const char* enr_name(int x) const { return env.name_of(AVar(store->aty(), x)).data(); }
+
+  /** Copy of everything a simplification step can change: domains, eliminated constraints, equivalence classes, TNF formulas. */
+  struct enr_snapshot {
+    std::vector<universe_type> dom;
+    std::vector<bool> elim;
+    std::vector<int> root;
+    std::vector<F> tnf;
+  };
+
+  template <class Seq>
+  enr_snapshot enr_take(const Seq& tnf) const {
+    enr_snapshot s;
+    for(int i = 0; i < store->vars(); ++i) { s.dom.push_back((*store)[i]); s.root.push_back(simplifier->enr_root(i)); }
+    for(int i = 0; i < tnf.size(); ++i) { s.elim.push_back(simplifier->enr_is_formula_eliminated(i)); s.tnf.push_back(tnf[i]); }
+    return s;
+  }
+
+  /** Print what `step` changed since the snapshot `s`. */
+  template <class Seq>
+  void enr_report(const char* step, const enr_snapshot& s, const Seq& tnf) const {
+    for(int i = 0; i < store->vars(); ++i) {
+      if(!(s.dom[i] == (*store)[i])) {
+        printf("%%   [%s] domain %s: ", step, enr_name(i)); s.dom[i].print(); printf(" -> "); (*store)[i].print(); printf("\n");
+      }
+      int r = simplifier->enr_root(i);
+      if(r != s.root[i]) { printf("%%   [%s] merged %s into the class of %s (now equal variables)\n", step, enr_name(i), enr_name(r)); }
+    }
+    for(int i = 0; i < tnf.size(); ++i) {
+      if(!s.elim[i] && simplifier->enr_is_formula_eliminated(i)) {
+        printf("%%   [%s] removed constraint c%d: ", step, i); tnf[i].print(); printf("\n");
+      }
+      else if(!s.elim[i] && tnf[i] != s.tnf[i]) {
+        printf("%%   [%s] rewrote constraint c%d: ", step, i); s.tnf[i].print(); printf("  ==>  "); tnf[i].print(); printf("\n");
+      }
+    }
+  }
+
+  /** `iprop->deduce(i)` that also prints which variables propagator `i` narrowed (used in the CPU fixpoint of preprocessing). */
+  bool enr_traced_deduce(size_t i) {
+    auto bc = iprop->load_deduce(i);
+    universe_type before[3] = {(*store)[bc.x.vid()], (*store)[bc.y.vid()], (*store)[bc.z.vid()]};
+    bool changed = iprop->deduce(i);
+    if(changed) {
+      bool cmp = (bc.op == lala::EQ || bc.op == lala::LEQ);
+      printf("%%   [propagation] p%d (%s = %s%s %s %s%s) narrowed:", (int)i, env.name_of(bc.x).data(), cmp ? "(" : "",
+        env.name_of(bc.y).data(), lala::string_of_sig(bc.op), env.name_of(bc.z).data(), cmp ? ")" : "");
+      AVar v[3] = {bc.x, bc.y, bc.z};
+      for(int k = 0; k < 3; ++k) {
+        if(!(before[k] == (*store)[v[k].vid()])) {
+          printf("  %s ", env.name_of(v[k]).data()); before[k].print(); printf("->"); (*store)[v[k].vid()].print();
+        }
+      }
+      printf("\n");
+    }
+    return changed;
+  }
+  //ENR STATS -- end
+
   void preprocess_tcn(F& f) {
+
+    // ternarize 
     f = ternarize(f, VarEnv<BasicAllocator>(), {0,1,2});
     battery::vector<F> extra;
+
+    //normalize
     f = normalize(f, extra);
+    
     size_t num_vars = num_quantified_vars(f);
     stats.print_stat("tnf_variables", num_vars);
     stats.print_stat("tnf_constraints", num_tnf_constraints(f));
@@ -517,13 +617,17 @@ public:
     if(!interpret(f)) {
       exit(EXIT_FAILURE);
     }
+    enr_dump("BEFORE simplification (ternarized problem, initial domains)"); //ENR STATS
     simplifier->init_env(env);
+
     if(config.disable_simplify) {
       /** Even when we don't simplify, we still need to initialize the equivalence classes.
        * This is necessary to call `print_variable` on `simplifier` when finding a solution. */
       simplifier->initialize(num_vars, 0);
+      enr_dump("AFTER (simplification disabled: same problem, sent to the solver)"); //ENR STATS
       return;
     }
+    
     auto& tnf = f.seq();
     simplifier->initialize_tnf(num_vars, tnf);
     size_t preprocessing_fixpoint_iterations = 0;
@@ -531,31 +635,57 @@ public:
     size_t eliminated_variables = 0;
     local::B has_changed = true;
     GaussSeidelIteration fp_engine;
+    const bool enr_trace = enr_level() >= 2; //ENR STATS
+    enr_snapshot enr_s; //ENR STATS
     /** We apply several preprocessing steps until we reach a fixpoint. */
     while(!iprop->is_bot() && has_changed) {
       has_changed = false;
       preprocessing_fixpoint_iterations++;
+      if(enr_trace) { printf("%% [ENR] ----- simplification round %d -----\n", (int)preprocessing_fixpoint_iterations); } //ENR STATS
       SimplifierStats local_preprocessing_stats;
+      // Step 1: propagation on the CPU (each propagator narrows domains until nothing changes).
       fp_engine.fixpoint(iprop->num_deductions(),
-        [&](size_t i) { return iprop->deduce(i); },
+        [&](size_t i) -> bool { if(enr_trace) { return enr_traced_deduce(i); } return iprop->deduce(i); }, //ENR STATS: was `return iprop->deduce(i);`
         [&](){ return iprop->is_bot(); },
         has_changed);
+      // Step 2: variables in the same equivalence class get the intersection of their domains.
+      if(enr_trace) { enr_s = enr_take(tnf); } //ENR STATS
       if(has_changed) {
         simplifier->meet_equivalence_classes();
       }
+      if(enr_trace) { enr_report("meet_equivalence_classes", enr_s, tnf); enr_s = enr_take(tnf); } //ENR STATS
+      // Step 3: algebraic rewriting rules (x = y + 0, x = y * 1, x = (y = z) with x = 1, ...).
       has_changed |= simplifier->algebraic_simplify(tnf, local_preprocessing_stats);
+      if(enr_trace) { enr_report("algebraic_simplify", enr_s, tnf); enr_s = enr_take(tnf); } //ENR STATS
+      // Step 4: remove constraints that are always true for the current domains.
       simplifier->eliminate_entailed_constraints(*iprop, tnf, local_preprocessing_stats);
+      if(enr_trace) { enr_report("eliminate_entailed", enr_s, tnf); enr_s = enr_take(tnf); } //ENR STATS
+      // Step 5: common subexpression elimination (x = y op z and x' = y op z  ->  x = x').
       if(num_vars < 1000000) { // otherwise ICSE is too slow, needs to be improved.
         has_changed |= simplifier->i_cse(tnf, local_preprocessing_stats);
       }
+      if(enr_trace) { enr_report("i_cse", enr_s, tnf); enr_s = enr_take(tnf); } //ENR STATS
       if(has_changed) {
         simplifier->meet_equivalence_classes();
         local_preprocessing_stats.print(stats, preprocessing_fixpoint_iterations);
       }
+      if(enr_trace) { enr_report("meet_equivalence_classes", enr_s, tnf); } //ENR STATS
       preprocessing_stats.merge(local_preprocessing_stats);
     }
     // simplifier->eliminate_entailed_constraints(*iprop, tnf, preprocessing_stats);
+    // Step 6 (once, after the loop): drop variables that are fixed, merged into another one, or not used by any constraint.
     simplifier->eliminate_useless_variables(tnf, eliminated_variables);
+    if(enr_trace) { //ENR STATS
+      printf("%% [ENR] ----- eliminate_useless_variables (fixed / merged / unused) -----\n");
+      for(int i = 0; i < store->vars(); ++i) {
+        if(simplifier->enr_is_variable_eliminated(i)) {
+          int r = simplifier->enr_root(i);
+          printf("%%   removed variable %s ", enr_name(i)); (*store)[i].print();
+          if(r != i) { printf("  (equal to %s)", enr_name(r)); }
+          printf("\n");
+        }
+      }
+    }
     f = simplifier->deinterpret(tnf, true);
     F extra_f = F::make_nary(AND, std::move(extra));
     simplifier->substitute(extra_f);
@@ -570,12 +700,14 @@ public:
     stats.print_stat("variables_after_simplification", num_vars);
     stats.print_stat("constraints_after_simplification", num_tnf_constraints(f2));
     if(iprop->is_bot()) {
+      enr_dump("AFTER simplification loop: FAILED at root (ternarized problem, propagated domains)"); //ENR STATS
       return;
     }
     allocate(num_vars, false);
     if(!interpret(f2)) {
       exit(EXIT_FAILURE);
     }
+    enr_dump("AFTER simplification (final problem, sent to the solver)"); //ENR STATS
   }
 
   const char* name_of_abstract_domain() const {
@@ -598,9 +730,13 @@ public:
 
   void preprocess() {
     auto start = stats.start_timer_host();
+    
+    //creates AST from .fzn or .xcsp3 file and stores it in f_ptr
     FormulaPtr f_ptr = parse_cn();
+
     stats.print_stat("abstract_domain", name_of_abstract_domain());
     stats.print_stat("entailed_prop_removal", name_of_entailed_removal());
+
     if(config.arch == Arch::BAREBONES) {
       auto max_var = find_maximize_var(*f_ptr);
       if(max_var.has_value()) {
@@ -610,6 +746,7 @@ public:
         }
       }
     }
+
   #ifdef TURBO_IPC_ABSTRACT_DOMAIN
     constexpr bool use_ipc = true;
   #else
@@ -637,6 +774,8 @@ public:
     stats.print_mzn_end_stats();
   }
 
+
+  
 private:
   template <class F>
   CUDA bool interpret_default_strategy() {

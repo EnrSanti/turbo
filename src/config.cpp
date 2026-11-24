@@ -28,6 +28,8 @@ void usage_and_exit(const std::string& program_name) {
   std::cout << "\t-or 48: Run the subproblems on 48 streaming multiprocessors (SMs) (only for GPU architecture). Default: -or 0 for automatic selection of the number of SMs." << std::endl;
   std::cout << "\t-sub 12: Create 2^12 subproblems to be solved in turns by the blocks (embarrasingly parallel search). The special value `-1` leaves Turbo to decide on the number of subproblems (at least 30 * number of blocks). Default: -sub -1." << std::endl;
   std::cout << "\t-subfactor 30: Create B * 30 subproblems to be solved in turns by `B` blocks (embarrasingly parallel search). Default: -subfactor 30." << std::endl;
+  std::cout << "\t-restart 10: (barebones) Load-balancing restart: when 10% of the blocks are idle, the busy blocks stop at the end of their current node, their open nodes are collected and re-split among all the blocks (default: 0 = disabled)." << std::endl; //ENR CODE
+  std::cout << "\t-restart_each_block: (barebones) Load-balancing restart as soon as one block is idle (same as -restart with a threshold of 1 block). After a restart the open nodes are cut into at least B * subfactor subproblems." << std::endl; //ENR CODE
   std::cout << "\t-eps_var_order <input_order|first_fail|anti_first_fail|smallest|largest|random>: Choose the variable ordering strategy for subproblems decomposition (default: same as main search strategy)." << std::endl;
   std::cout << "\t-eps_value_order <min|max|split|reverse_split>: Choose the value ordering strategy for subproblems decomposition (default: same as main search strategy)." << std::endl;
   std::cout << "\t-seed 0: Set the seed for the random number generator (default: 0)." << std::endl;
@@ -135,6 +137,8 @@ Configuration<battery::standard_allocator> parse_args(int argc, char** argv) {
   }
   input.read_int("-sub", config.subproblems_power);
   input.read_size_t("-subfactor", config.subproblems_factor);
+  input.read_size_t("-restart", config.enr_restart_idle_pct); //ENR CODE
+  input.read_bool("-restart_each_block", config.enr_restart_each_block); //ENR CODE
   input.read_size_t("-p", config.or_nodes);
   input.read_size_t("-or", config.or_nodes);
   input.read_size_t("-t", config.timeout_ms);

@@ -38,6 +38,16 @@ set(TURBO_INITLIB "" CACHE STRING "Include an external initialization library to
 
 include(FetchContent)
 
+# ENR STATS -- begin: build against a local, editable clone of lala-core (../lala-core, tag v1.2.8) instead of the GitHub download.
+# FetchContent keeps the FIRST declaration of a name, so this one overrides the lala_core declared inside lala-pc, lala-power and lala-parsing.
+# Disable with -DLOCAL_LALA_CORE=OFF to go back to the downloaded copy.
+option(LOCAL_LALA_CORE "Use ../lala-core instead of downloading it" ON)
+if(LOCAL_LALA_CORE)
+  FetchContent_Declare(lala_core SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../lala-core/")
+  message(STATUS "ENR: using local lala-core from ${CMAKE_CURRENT_LIST_DIR}/../lala-core/")
+endif()
+# ENR STATS -- end
+
 if(LOCAL_DEPS)
   FetchContent_Declare(lala_pc SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../lala-pc/")
   FetchContent_Declare(lala_parsing SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../lala-parsing/")

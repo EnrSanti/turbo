@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Restart Grid Sync</title>
+<style>
+:root { --ink:#1d2330; --mute:#5b6475; --line:#d5dae3; --bg:#ffffff; --accent:#2f5fd0;
+  --r0:#3d5fa8; --r1:#2e9e6a; --idle:#d2483c; --sync:#e0662f; --cool:#7c93c9; }
+@page { size: A4; margin: 15mm 14mm 16mm 14mm; }
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 10.2pt/1.42 "DejaVu Sans", "Helvetica", sans-serif; margin: 0 auto; max-width: 760px; padding: 0 16px; }
+h1 { font-size: 19pt; margin: 0 0 2px; letter-spacing: -0.2px; }
+h2 { font-size: 13pt; margin: 18px 0 6px; padding-bottom: 3px; border-bottom: 1.5px solid var(--line); break-after: avoid; }
+h3 { font-size: 10.8pt; margin: 12px 0 4px; break-after: avoid; }
+p { margin: 5px 0; }
+.sub { color: var(--mute); margin-bottom: 10px; }
+.note { border-left: 3px solid var(--accent); background: #f3f6fd; padding: 6px 10px; margin: 8px 0; break-inside: avoid; }
+.warn { border-left: 3px solid var(--idle); background: #fdf3f2; padding: 6px 10px; margin: 8px 0; break-inside: avoid; }
+.later { border-left: 3px solid var(--sync); background: #fdf5ef; padding: 6px 10px; margin: 8px 0; break-inside: avoid; }
+.thm { border: 1px solid var(--line); background: #fafbfd; padding: 6px 10px; margin: 8px 0; break-inside: avoid; }
+.thm b.t { color: var(--accent); }
+code, .mono { font-family: "DejaVu Sans Mono", monospace; font-size: 8.8pt; }
+pre { font-family: "DejaVu Sans Mono", monospace; font-size: 8.1pt; line-height: 1.32; background: #f6f7fa; border: 1px solid var(--line); padding: 7px 9px; margin: 6px 0; white-space: pre-wrap; break-inside: avoid; }
+pre .new { background: #dff3e8; } pre .chg { background: #fff0d6; } pre .c { color: var(--mute); }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.1pt; break-inside: avoid; }
+th, td { border: 1px solid var(--line); padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #f1f3f7; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+ol, ul { margin: 4px 0 4px 20px; padding: 0; } li { margin: 2px 0; }
+figure { margin: 8px 0; break-inside: avoid; }
+figcaption { color: var(--mute); font-size: 8.8pt; margin-top: 2px; }
+svg { width: 100%; height: auto; display: block; }
+svg text { font-family: "DejaVu Sans", sans-serif; fill: var(--ink); font-size: 9px; }
+svg .m { fill: var(--mute); font-size: 8px; } svg .b { font-weight: bold; } svg .mono { font-family: "DejaVu Sans Mono", monospace; font-size: 8.4px; }
+.pb { break-before: page; }
+.tag { display:inline-block; font-size: 8pt; padding: 0 5px; border-radius: 3px; background:#e6f4ec; color:#1f6e49; border:1px solid #b9dfc9; }
+.tag.d { background:#fff0d6; color:#8a5a00; border-color:#f0d29a; }
+</style></head><body>
+
+<h1>Restarts entirely on the GPU: one round loop, two grid syncs</h1>
+<div class="sub">Turbo 1.2.8, barebones (<code>include/barebones_dive_and_solve.hpp</code>). Rev. 5, 2026-11-18: <b>theory + the implementation as it is in the code</b>
+(implemented 2026-11-17, uncommitted, every change tagged <code>//RESTART</code> in <code>barebones_dive_and_solve.hpp</code>, <code>config.hpp</code>, <code>config.cpp</code>, <code>statistics.hpp</code>).
+Line numbers refer to the current, modified files. Continues <code>RESTART_STRATEGY.pdf</code> (restart type A, load balancing). Rev. 4 (design only) is replaced by this document.</div>
+
+<h2>0. Summary</h2>
+<ol>
+<li><b>Rounds inside one cooperative kernel.</b> Round 0 is today's EPS search. A block that runs out of work counts itself idle and waits in <code>grid.sync()</code>. When enough blocks are idle, a <b>busy</b> block raises a global flag; every busy block stops at the end of its current node. All blocks meet at <b>S1</b>, the busy ones publish their open nodes, block 0 resets the round at the same time, all meet at <b>S3</b>, and the next round starts on the published nodes (§2–§4).</li>
+<li><b>Open nodes of any depth</b> are fixed 8-byte items <code>{snap, k, c}</code> = "path of block <code>snap</code> down to level <code>k</code>, then child <code>c</code>", pointing into a per-block <b>snapshot</b> (copy of <code>root_store</code> + decision stack). Rebuilding an item is the barebones backtrack (§5).</li>
+<li><b>Too few items</b> are split by one uniform depth <code>s</code> = smallest with <code>n·2<sup>s</sup> ≥ T</code>, <code>T = restart_subfactor · B</code>: index <code>j</code> → item <code>j &gt;&gt; s</code>, dive on the low <code>s</code> bits. Steps D and E of the dive are unchanged (§6).</li>
+<li><b>Without <code>-restart</code></b> (default 0) the kernel takes the old path: normal <code>&lt;&lt;&lt;…&gt;&gt;&gt;</code> launch, the round loop runs once and leaves before any barrier.</li>
+<li>Side effects of the work: an upstream race in step E fixed (counter moved backwards, §7.1; also affects the non-restart path) and a new statistic <code>tree_nodes</code> that counts each node of the search tree once (§8), used to prove that the restarts neither lose nor duplicate work.</li>
+</ol>
+
+<table>
+<tr><th>option (config.cpp:31–35, config.hpp:51–54)</th><th>default</th><th>meaning</th></tr>
+<tr><td><code>-restart P</code></td><td>0 (off)</td><td>restart when ⌈P·B/100⌉ blocks are idle (at least 1)</td></tr>
+<tr><td><code>-restart_min_ms M</code></td><td>1000</td><td>a round lasts at least M ms before it can be restarted</td></tr>
+<tr><td><code>-restart_subfactor F</code></td><td>30</td><td>a restarted round has at least <code>T = F·B</code> subproblems</td></tr>
+<tr><td><code>-restart_max K</code></td><td>0 (∞)</td><td>at most K restarts that redistribute work</td></tr>
+</table>
+
+<h2 class="pb">1. Theory</h2>
+
+<h3>1.1 The search tree and EPS</h3>
+<p>Barebones explores a binary tree: at a node the split strategy picks a variable and two complementary children <code>L = children[0]</code>, <code>R = children[1]</code> (for intervals x ≤ m / x ≥ m+1, so <code>R = ¬L</code> at that node).
+Embarrassingly Parallel Search (Régin, Rezgui, Malapert, CP 2013) cuts the tree at a fixed depth <code>D</code> into 2<sup>D</sup> subproblems; Turbo's variant identifies subproblem <code>j</code> with the bit path of <code>j</code> (bit = left/right at each dive level, l.1008) and hands indices out with one atomic counter (l.1229).
+In round 0, <code>D = subproblems_power = ⌈log2(30·B)⌉ = 11</code> for B = 40, i.e. 2048 subproblems.</p>
+<p>The dyadic structure is what step E uses: if the dive reaches a leaf (failed or solved) with <code>rd</code> bits left, all indices of the aligned block <code>[⌊j/2<sup>rd</sup>⌋·2<sup>rd</sup>, (⌊j/2<sup>rd</sup>⌋+1)·2<sup>rd</sup>)</code> share that leaf, and the counter jumps to the end of the block.</p>
+<p>The weakness measured on accap (2026-11-11 baselines): EPS has no work stealing, subproblem sizes are very uneven, so the last few subproblems keep a few blocks busy while the rest is idle (61 % idle at 2000 s). A restart re-splits the work that is <i>still open</i> among all blocks.</p>
+
+<h3>1.2 The open frontier of a DFS stack</h3>
+<p>Let the stack of a block have entries <code>0…d−1</code>; entry <code>k</code> stores the decision at level <code>k</code> and <code>current_idx ∈ {0,1}</code>, the child it is in. Write <code>P<sub>k</sub> = dec[0..k).current()</code> for the path above level <code>k</code>.</p>
+<div class="thm"><b class="t">Proposition 1 (frontier partition).</b> Stop a depth-first, left-first search at a point where the current node <code>P<sub>d</sub></code> has been reached but not propagated. Then the unexplored part of the block's subproblem is exactly the disjoint union of
+<ul>
+<li><code>P<sub>k</sub> ∧ R<sub>k</sub></code> for every level <code>k</code> with <code>current_idx = 0</code> (right branch never started), and</li>
+<li>the current node <code>P<sub>d−1</sub> ∧ children[current_idx]<sub>d−1</sub></code>.</li>
+</ul>
+<i>Proof sketch.</i> Walk from the root to the current node. At a level with <code>current_idx = 1</code> the search came back from <code>L<sub>k</sub></code>: by DFS order that subtree was explored exhaustively, so nothing open is in it. At a level with <code>current_idx = 0</code> the search is still inside <code>L<sub>k</sub></code>; <code>R<sub>k</sub></code> is untouched. Every node not on the path lies in exactly one of these sibling subtrees or below the current node, and siblings are disjoint because <code>R<sub>k</sub> = ¬L<sub>k</sub></code>. ∎</div>
+<p>This is Lecoutre et al., "Recording and minimizing nogoods from restarts" (JSAT 2007), Prop. 1, seen from the other side: the levels with <code>current_idx = 1</code> are exactly the negative decisions of the branch, and each gives the nld-nogood <code>P<sub>k</sub> ∧ L<sub>k</sub></code> (the refuted left subtree). Our restart keeps the <b>same tree</b> (same order, only re-split), so these nogoods need not be stored: they are simply not in the open set. Nogoods would be needed only for a restart that changes the tree (type B in <code>RESTART_STRATEGY.pdf</code>).</p>
+<p><b>Branch-and-bound.</b> In optimisation the search does not stop at a solution, so "explored <code>L<sub>k</sub></code>" means "no solution better than the bound in force while <code>L<sub>k</sub></code> was explored". The bound only decreases, so the refutation stays valid in every later round, provided the next round uses a bound at least as tight. The reset computes the exact bound (§4, step 1).</p>
+<p>Across blocks, the subproblems of a round are disjoint, so the union of all frontiers at S1 is exactly the unexplored part of the whole problem (indices not handed out yet do not exist at that moment: see §3.1).</p>
+
+<h3>1.3 Splitting items: dyadic alignment</h3>
+<div class="thm"><b class="t">Proposition 2.</b> With <code>n</code> items and a uniform depth <code>s</code>, item <code>i</code> owns the indices <code>I<sub>i</sub> = [i·2<sup>s</sup>, (i+1)·2<sup>s</sup>)</code>. For any <code>j ∈ I<sub>i</sub></code> and any <code>rd ≤ s</code>, the skip target <code>((j &gt;&gt; rd)+1) &lt;&lt; rd</code> is either inside <code>I<sub>i</sub></code> or equal to <code>(i+1)·2<sup>s</sup></code>.
+<i>Proof.</i> <code>I<sub>i</sub></code> is a union of aligned blocks of size 2<sup>rd</sup> because 2<sup>rd</sup> divides 2<sup>s</sup>. ∎</div>
+<p>So E never skips into, or out of the middle of, another item: each item is split exactly as EPS splits the root. Step D and E need only <code>remaining_depth = s</code> instead of <code>subproblems_power</code>. Round 0 is the case <code>n = 1</code> (the root), <code>s = subproblems_power</code>.</p>
+
+<h3>1.4 Grid barriers and the one-writer rule</h3>
+<p><code>cooperative_groups::this_grid().sync()</code> is a barrier for all threads of all blocks <b>and</b> a device-wide memory fence; it is legal only with <code>cudaLaunchCooperativeKernel</code> and all blocks co-resident (a block not yet scheduled could never arrive). Between two barriers the code obeys one rule: <b>every datum is either written or read in the window, never both, and each written datum has a single writer or is updated atomically</b>. Then no further synchronisation is needed inside the window, and after the next barrier every block sees all the writes. §4 lists the data.</p>
+<p>A value that decides whether a block leaves the round loop must be <b>grid-uniform</b>: if one block leaves while another enters the next <code>grid.sync()</code>, the GPU hangs. Hence all exit decisions are taken on values written before S3 and read after it (<code>host_stop</code>, <code>n</code>), never on the per-block shared <code>stop</code>.</p>
+
+<h3>1.5 Lost updates: <code>meet</code> is not atomic</h3>
+<p><code>ZLB::meet</code> / <code>ZUB::meet</code> on <code>atomic_memory_grid</code> are load / compare / store: each access is atomic, the read-modify-write is not. Two concurrent writers can lose an update. Consequences in the code:</p>
+<ul>
+<li><code>appx_best_bound</code> (l.1541) can be worse than the best bound found (as the name says). Harmless for soundness; fixed exactly at every restart (§4, step 1).</li>
+<li><code>next_subproblem.meet(x)</code> in step E can move the counter <b>backwards</b> (§7.1). That is a real bug: indices handed out twice. Replaced by an atomic <code>fetch_max</code>.</li>
+</ul>
+
+<h2 class="pb">2. One restart, step by step</h2>
+<figure>
+<svg viewBox="0 0 720 196" role="img" aria-label="Timeline of a restart with two grid syncs">
+  <text x="4" y="12" class="b">One restart, 5 of the 40 blocks shown (schematic)</text>
+  <text x="4" y="36">b0</text><text x="4" y="58">b1</text><text x="4" y="80">b2</text><text x="4" y="102">b3</text><text x="4" y="124">b4</text>
+  <rect x="30" y="27" width="250" height="13" fill="var(--r0)"/><rect x="280" y="27" width="60" height="13" fill="var(--idle)"/>
+  <rect x="30" y="49" width="310" height="13" fill="var(--r0)"/>
+  <rect x="30" y="71" width="200" height="13" fill="var(--r0)"/><rect x="230" y="71" width="110" height="13" fill="var(--idle)"/>
+  <rect x="30" y="93" width="310" height="13" fill="var(--r0)"/>
+  <rect x="30" y="115" width="295" height="13" fill="var(--r0)"/><rect x="325" y="115" width="15" height="13" fill="var(--idle)"/>
+  <line x1="300" y1="20" x2="300" y2="135" stroke="var(--sync)" stroke-dasharray="3 2"/>
+  <text x="196" y="148" class="m">b1 sees idle ≥ threshold → raises flag</text>
+  <rect x="340" y="22" width="4" height="112" fill="var(--ink)"/><text x="333" y="160" class="b">S1</text>
+  <rect x="346" y="49" width="18" height="13" fill="#cfd6e6"/><rect x="346" y="93" width="18" height="13" fill="#cfd6e6"/>
+  <rect x="346" y="27" width="18" height="13" fill="var(--sync)"/>
+  <rect x="366" y="22" width="4" height="112" fill="var(--ink)"/><text x="360" y="160" class="b">S3</text>
+  <rect x="372" y="27" width="320" height="13" fill="var(--r1)"/>
+  <rect x="372" y="49" width="300" height="13" fill="var(--r1)"/><rect x="672" y="49" width="20" height="13" fill="var(--idle)"/>
+  <rect x="372" y="71" width="320" height="13" fill="var(--r1)"/>
+  <rect x="372" y="93" width="310" height="13" fill="var(--r1)"/><rect x="682" y="93" width="10" height="13" fill="var(--idle)"/>
+  <rect x="372" y="115" width="320" height="13" fill="var(--r1)"/>
+  <text x="90" y="186" class="m">round 0: EPS subproblems</text>
+  <text x="300" y="186" class="m">harvest ‖ reset</text>
+  <text x="500" y="186" class="m">round 1: frontier items</text>
+</svg>
+<figcaption><span style="color:var(--r0)">■</span> round 0 &nbsp; <span style="color:var(--r1)">■</span> round 1 &nbsp; <span style="color:var(--idle)">■</span> idle (waiting in S1) &nbsp;
+grey = busy blocks b1, b3 publish their open nodes &nbsp; <span style="color:var(--sync)">■</span> block 0 resets the round, at the same time. Drain = flag → S1 (statistic <code>restart_drain_ms_*</code>).</figcaption>
+</figure>
+
+<table>
+<tr><th>barrier</th><th>guaranteed after it</th><th>then, until the next barrier</th></tr>
+<tr><td><b>S1</b> (l.1256)</td><td>nobody explores; all stacks, <code>root_store</code>s and <code>best_bound</code>s are frozen; nobody reads the counter, the flag or the snapshots</td>
+<td>blocks with <code>open_subproblem</code>: write snapshot + items (one <code>fetch_add</code> per block). <b>In parallel</b>, block 0 thread 0: exact bound, counter/flag/idle reset, read the host stop (§4)</td></tr>
+<tr><td><b>S3</b> (l.1346)</td><td>all items written, <code>n_items[r&amp;1]</code> final; reset visible</td><td>every block reads <code>n</code> and <code>host_stop</code> (same values for all), computes <code>s</code> and <code>num_subproblems</code> itself, exits or starts the round</td></tr>
+</table>
+<p>The "S2" barrier of the earlier revisions (needed only to sort items or give them different depths) is not implemented; see §10.</p>
+
+<h2>3. The kernel as implemented</h2>
+<p>Green = new, orange = changed with respect to the pre-restart code (binary kept as <code>build/gpu-release/turbo.before_restart</code>).</p>
+<pre><span class="c">// gpu_barebones_solve</span>
+A. block_data.allocate(...);                                            <span class="c">// unchanged</span>
+<span class="new">   if(restart_enabled) block_data.allocate_snapshot(...);          // l.847: snap_store, snap_dec (§5.2)</span>
+   fp_engine.init(...);  __shared__ bool stop, has_changed, is_leaf_node;
+<span class="new">__shared__ bool restart, open_subproblem;  __shared__ int s_bits;    // l.883–902</span>
+<span class="new">__shared__ size_t num_subproblems;  __shared__ FrontierItem cur_item;</span>
+<span class="new">s_bits = subproblems_power; num_subproblems = eps_num_subproblems;  int round = 0;</span>
+<span class="new">while(true) {                                                        // round loop</span>
+  while(subproblem_idx &lt; num_subproblems &amp;&amp; !stop) {                 <span class="c">// B, l.903: condition unchanged (§3.1)</span>
+    <span class="chg">C.  round == 0 ? copy the global root (l.918–921)</span>
+    <span class="chg">  : C'. rebuild item idx &gt;&gt; s_bits from its snapshot (l.922–953)   §5.3</span>
+        fp_engine.reset under #ifndef TURBO_NO_ENTAILED_PROP_REMOVAL   <span class="c">// shared by both paths</span>
+    <span class="chg">D.  remaining_depth = s_bits;</span>                                     <span class="c">// l.967, was subproblems_power</span>
+    <span class="new">    in_tree = (low remaining_depth bits of idx == 0)               // l.985, statistic §8</span>
+    <span class="chg">E.  skip: next_subproblem.atomic().fetch_max(...)</span>             <span class="c">// l.1050, bug fix §7.1</span>
+    F.  while(!stop) {
+          I, II propagate (polls/raises the restart flag, §3.2), III split, IV backtrack
+<span class="new">          if(restart) { open_subproblem = !stop; break; }           // l.1205, END of the body</span>
+        }
+    <span class="chg">    solved += 1 only if !stop &amp;&amp; !open_subproblem</span>                 <span class="c">// l.1215–1220</span>
+    G.  if(thread 0 &amp;&amp; !stop) idx = next.atomic()++;                  <span class="c">// l.1229, unchanged</span>
+  }
+<span class="new">  if(!restart_enabled) break;                         // l.1241: old behaviour, no barrier</span>
+<span class="new">  thread 0: if(!stop &amp;&amp; !restart) idle_blocks++;      // this block ran out of work</span>
+<span class="new">  grid.sync();  ++round;                              // S1</span>
+<span class="new">  if(open_subproblem) harvest();                      // l.1260–1317, §5.2</span>
+<span class="new">  if(block 0, thread 0) reset_round();                // l.1319–1344, §4</span>
+<span class="new">  grid.sync();                                        // S3</span>
+<span class="new">  n = n_items[round &amp; 1];  finished = host_stop || n == 0;   // grid-uniform</span>
+<span class="new">  thread 0, if !finished: s = min s with n·2^s ≥ T (cap 40); num_subproblems = n &lt;&lt; s;
+            restart = open_subproblem = false; subproblem_idx = blockIdx.x; block 0: stats</span>
+<span class="new">  if(finished) break;</span>
+<span class="new">}</span>
+end-of-block statistics, fp_engine.destroy(), deallocate                <span class="c">// unchanged</span></pre>
+
+<h3>3.1 Why the subproblem loop needs no <code>!restart</code></h3>
+<p>A block counts itself idle only if it left the loop with neither <code>stop</code> nor <code>restart</code>, i.e. because <code>subproblem_idx ≥ num_subproblems</code>. The counter only grows during a round, so once any block is idle the counter is exhausted, and the flag can only be raised after that (§3.2).
+Hence a block that breaks out of F because of the restart gets, in step G, an index ≥ <code>num_subproblems</code> and leaves the loop by itself. Guarding G with <code>!restart</code> without changing the loop condition would make the block explore its current subproblem again while its open nodes are also published.
+A restart that does not come from idle blocks (timer, forced debug restarts) would need <code>!restart</code> in both places; none is implemented.</p>
+
+<h3>3.2 Trigger: raised by a busy block, in <code>propagate()</code></h3>
+<p><b>Change from rev. 4:</b> the design had the idle block raise the flag when it incremented the counter. Implemented instead (l.1584–1601), once per node in thread 0 of every block:</p>
+<pre>if(restart_enabled &amp;&amp; !restart) {
+  if(restart_flag != 0) restart = true;                                <span class="c">// someone raised it</span>
+  else if(idle_blocks &gt;= restart_threshold &amp;&amp; (restart_max == 0 || st_restarts &lt; restart_max)
+          &amp;&amp; now - round_start_ns &gt;= restart_min_ns) {
+    if(restart_flag.compare_exchange_strong(0, 1)) raise_ns = now;     <span class="c">// one winner records the time</span>
+    restart = true;
+  }
+}</pre>
+<p>Reason: an idle block is already on its way to <code>grid.sync()</code> and will not look again. If it found <code>now − round_start &lt; T<sub>min</sub></code>, nobody would re-check later and the round would never restart. The busy blocks run nodes continuously, so the condition is re-evaluated until it holds.
+<code>restart_threshold = max(1, ⌈P·B/100⌉)</code> (l.130). The CAS makes the raise and its timestamp single-writer. The shared copy <code>restart</code> is read by all threads after the <code>__syncthreads()</code> that follows <code>propagate()</code>, so the whole block takes the same branch, as for <code>stop</code>. Unlike <code>stop</code>, it does not set <code>exhaustive = false</code>.</p>
+<p>The dive (D) and the rebuild (C') also call <code>propagate()</code> and may see the flag, but they are not interrupted: the block finishes the dive, enters F, and breaks at the end of the first DFS body. So at S1 nobody is in a dive or a rebuild, and a single snapshot buffer per block suffices.</p>
+
+<div class="warn"><b>Deadlock rules, as enforced in the code</b>
+<ol>
+<li>Every path out of the subproblem loop reaches S1: no <code>return</code> inside; the early exits (failed root, solved subproblem, E skip) go through G and the loop head.</li>
+<li>The round loop ends only on <code>host_stop</code> and <code>n</code>, written by block 0 before S3 and read after it.</li>
+<li><code>stop_after_n_nodes</code> is per block: with restarts it now also sets the global <code>unified_data.stop</code> (l.1580), so every block stops and block 0 reads <code>host_stop = true</code>.</li>
+<li>Idle blocks wait only in <code>grid.sync()</code>, never spin on a counter.</li>
+</ol></div>
+
+<h2 class="pb">4. Between S1 and S3: the reset (block 0, thread 0, l.1319–1344)</h2>
+<pre>for b in blocks: appx_best_bound.meet(blocks[b].best_bound);   <span class="c">// (1) exact bound, sequential</span>
+host_stop = unified_data-&gt;stop.test();                         <span class="c">// (2) read once</span>
+pending_drain_ns = restart_flag ? now - raise_ns : -1;         <span class="c">// statistics only</span>
+next_subproblem = ZLB(B);                                      <span class="c">// (3) plain store, meet() only increases</span>
+idle_blocks = 0;  restart_flag = 0;  round_start_ns = now;     <span class="c">// (4)(5)(6)</span>
+n_items[(round + 1) &amp; 1] = 0;                                  <span class="c">// (7) the counter of the NEXT restart</span></pre>
+<table>
+<tr><th>#</th><th>why</th><th>without it</th></tr>
+<tr><td>1</td><td>all blocks are stopped, their <code>best_bound</code>s frozen; one thread does the <code>meet</code>s in sequence, so no update is lost: the minimum is exact (§1.5)</td><td>the next round prunes with a possibly weaker bound: sound but slower</td></tr>
+<tr><td>2</td><td>the host can set <code>stop</code> at any moment; one read gives every block the same value</td><td>blocks read it at different moments: some exit, the others hang in the next <code>grid.sync()</code></td></tr>
+<tr><td>3</td><td>blocks 0…B−1 start on their own index, the counter hands out from B</td><td>counter ≥ old total: nobody finds work, empty round</td></tr>
+<tr><td>4–6</td><td>idle count, flag and <code>T<sub>min</sub></code> origin are per round</td><td>immediate re-trigger, or endless empty restarts</td></tr>
+<tr><td>7</td><td><code>n_items[r&amp;1]</code> is being incremented by the harvests and is read after S3; the other copy was last read at the start of the round that just ended, by blocks that are all past S1</td><td>stale count at the next restart: items at wrong positions</td></tr>
+</table>
+<table>
+<tr><th>data</th><th>written between S1 and S3 by</th><th>read between S1 and S3 by</th></tr>
+<tr><td><code>snap_*</code> of block b, <code>items[w<sub>b</sub>…w<sub>b</sub>+m)</code></td><td>block b only (disjoint ranges)</td><td>nobody (read by C' during the next round)</td></tr>
+<tr><td><code>n_items[r&amp;1]</code>, <code>st_truncated</code></td><td>harvesting blocks, <code>fetch_add</code></td><td>nobody</td></tr>
+<tr><td><code>blocks[b].best_bound</code>, <code>raise_ns</code></td><td>nobody (frozen)</td><td>block 0</td></tr>
+<tr><td><code>appx_best_bound</code>, <code>next_subproblem</code>, <code>idle_blocks</code>, <code>restart_flag</code>, <code>round_start_ns</code>, <code>host_stop</code>, <code>pending_*</code>, <code>n_items[(r+1)&amp;1]</code></td><td>block 0</td><td>block 0 only (<code>restart_flag</code>, before clearing it)</td></tr>
+<tr><td><code>unified_data-&gt;stop</code></td><td>the host, any time</td><td>block 0, once</td></tr>
+</table>
+<p>This is the one-writer rule of §1.4, so harvest and reset run concurrently with no barrier between them. Before S1 they could not: busy blocks still read the flag and the counter and increment <code>idle_blocks</code>.</p>
+<p><b>After S3</b> (l.1348–1392), thread 0 of every block computes <code>s</code> and <code>num_subproblems = n &lt;&lt; s</code> from the same <code>n</code>, clears its shared <code>restart</code>/<code>open_subproblem</code>, sets <code>subproblem_idx = blockIdx.x</code>; block 0 alone updates the grid statistics (<code>st_restarts</code>, items sum/max/last, subproblems, <code>s</code> max, drain, first/last restart time). The barrier wait is excluded from the ENR phases and from the timers (<code>enr_ph_t = timer = now</code>), and <code>enr_after_restore</code> is cleared (a backtrack interrupted by the restart is never followed by its fixpoint).</p>
+
+<h2 class="pb">5. Open nodes as items</h2>
+<h3>5.1 What is open when a block stops</h3>
+<p>The restart test is at the end of the DFS body (l.1205), after III/IV, so: <code>root_store</code> has always been taken (first iteration at depth 0); the last split or backtrack has <i>embedded</i> L or R without propagating it, so the current node is unexplored. This is the precondition of Proposition 1. If the block saw <code>stop</code> as well, <code>open_subproblem = false</code>: nothing is published, the search is ending anyway. A block whose subtree ended at the same node (fail at root, solved) leaves F earlier and also publishes nothing.</p>
+
+<figure>
+<svg viewBox="0 0 720 230" role="img" aria-label="Snapshot of a block and items pointing into it">
+  <text x="4" y="12" class="b">Block 17 at S1 → its snapshot → 3 fixed-size items</text>
+  <rect x="10" y="24" width="170" height="196" fill="none" stroke="var(--line)"/>
+  <text x="18" y="38" class="b">block_data (live)</text>
+  <rect x="20" y="46" width="150" height="20" fill="#eef1f8" stroke="var(--cool)"/><text x="26" y="60" class="mono">root_store (V × 16 B)</text>
+  <text x="20" y="112" class="m">depth = 4</text>
+  <rect x="20" y="186" width="150" height="20" fill="#fff" stroke="var(--ink)"/><text x="26" y="200" class="mono">[0] x3  ci=1  (L done)</text>
+  <rect x="20" y="164" width="150" height="20" fill="#fff" stroke="var(--ink)"/><text x="26" y="178" class="mono">[1] x9  ci=0  R pending</text>
+  <rect x="20" y="142" width="150" height="20" fill="#fff" stroke="var(--ink)"/><text x="26" y="156" class="mono">[2] x1  ci=1  (L done)</text>
+  <rect x="20" y="120" width="150" height="20" fill="#fff" stroke="var(--ink)"/><text x="26" y="134" class="mono">[3] x7  ci=0  R pending</text>
+  <defs><marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--ink)"/></marker></defs>
+  <line x1="185" y1="120" x2="235" y2="120" stroke="var(--ink)" marker-end="url(#ar)"/><text x="187" y="112" class="m">copy after S1</text>
+  <rect x="240" y="24" width="190" height="196" fill="none" stroke="var(--sync)"/>
+  <text x="248" y="38" class="b">blocks[17].snap_*</text>
+  <rect x="250" y="46" width="170" height="20" fill="#eef1f8" stroke="var(--cool)"/><text x="256" y="60" class="mono">snap_store = root_store</text>
+  <text x="250" y="82" class="mono">snap_root_strategy,</text>
+  <text x="250" y="94" class="mono">snap_root_next_unassigned_var</text>
+  <text x="250" y="112" class="mono">snap_depth = 4</text>
+  <rect x="250" y="186" width="170" height="20" fill="#fff" stroke="var(--ink)"/><text x="256" y="200" class="mono">snap_dec[0]</text>
+  <rect x="250" y="164" width="170" height="20" fill="#fff" stroke="var(--ink)"/><text x="256" y="178" class="mono">snap_dec[1]</text>
+  <rect x="250" y="142" width="170" height="20" fill="#fff" stroke="var(--ink)"/><text x="256" y="156" class="mono">snap_dec[2]</text>
+  <rect x="250" y="120" width="170" height="20" fill="#fff" stroke="var(--ink)"/><text x="256" y="134" class="mono">snap_dec[3]</text>
+  <text x="470" y="38" class="b">items[] (8 B each)</text>
+  <rect x="470" y="160" width="230" height="22" fill="#e6f4ec" stroke="var(--r1)"/><text x="476" y="175" class="mono">{17, k 1, c 1}  pending right</text>
+  <rect x="470" y="118" width="230" height="22" fill="#e6f4ec" stroke="var(--r1)"/><text x="476" y="133" class="mono">{17, k 3, c 1}  pending right</text>
+  <rect x="470" y="76" width="230" height="22" fill="#e6f4ec" stroke="var(--r1)"/><text x="476" y="91" class="mono">{17, k 3, c 0}  current node</text>
+  <line x1="470" y1="171" x2="422" y2="174" stroke="var(--r1)"/><line x1="470" y1="129" x2="422" y2="130" stroke="var(--r1)"/><line x1="470" y1="87" x2="422" y2="128" stroke="var(--r1)"/>
+  <text x="470" y="206" class="m">rebuild (k, c): store + dec[0..k).current() + dec[k].children[c]</text>
+  <text x="470" y="218" class="m">top entry ci = 0 (last action: split) → two items at k = 3</text>
+</svg>
+<figcaption>The variable-length paths stay in the snapshot; an item has constant size whatever its depth. Items of one block are written shallowest first, then the current node.</figcaption>
+</figure>
+
+<h3>5.2 Snapshot and harvest (l.1260–1317)</h3>
+<pre>struct FrontierItem { int snap; unsigned k : 31; unsigned c : 1; };   <span class="c">// l.99, 8 B</span>
+<span class="c">// in BlockData (l.211): allocated once by allocate_snapshot() when -restart &gt; 0</span>
+abstract_ptr&lt;VStore&lt;Itv, global_allocator&gt;&gt; snap_store;              <span class="c">// copy of the root store</span>
+vector&lt;LightBranch&lt;Itv&gt;, global_allocator&gt; snap_dec;                 <span class="c">// sized like decisions</span>
+int snap_depth, snap_root_strategy, snap_root_next_unassigned_var;
+<span class="c">// in GridData: items (B × 1024), n_items[2], restart_flag, idle_blocks, ... (l.503–530)</span></pre>
+<ol>
+<li>If <code>decisions</code> has grown (<code>push_decision</code> doubles it), thread 0 resizes <code>snap_dec</code>.</li>
+<li><code>root_store-&gt;copy_to(group, *snap_store)</code>; the threads copy <code>decisions[0..depth)</code> field by field (var, children, ropes, current_idx), strided.</li>
+<li>Thread 0: <code>snap_depth</code>, root strategy and next variable (the values the backtrack restores at depth 0, from <code>snapshot_root_*</code>); counts <code>pending = #{k : current_idx = 0}</code>; reserves <code>m = pending + 1</code> slots with one <code>n_items[round&amp;1].fetch_add(m)</code>; writes <code>(k, 1)</code> for each pending level, bottom-up, then <code>(depth−1, current_idx of depth−1)</code>.</li>
+</ol>
+<p><b>Quota</b> <code>items_per_block = 1024</code>, so <code>n ≤ B·1024</code> and <code>items</code> never overflows. If <code>pending + 1 &gt; 1024</code> (not expected: it needs more than 1023 pending right branches on one stack), the block keeps the 1023 shallowest pending right branches and, as last item, the child it is in at the level of the last kept one (<code>c = 0</code>): it covers every deeper open node and re-explores some refuted parts. Nothing is lost; counted in <code>restart_truncated_blocks</code>.</p>
+<p>One snapshot and one item array suffice: they are written only between S1 and S3 and read only during a round. Once an item is rebuilt, its whole prefix is inside the new <code>root_store</code>, so at the next restart the block snapshots that store and a short stack: paths never accumulate across rounds. The dive decisions are not on the stack (they are in <code>root_store</code> already).</p>
+
+<h3>5.3 Rebuilding an item (C', l.922–953)</h3>
+<pre>thread 0: cur_item = items[subproblem_idx &gt;&gt; s_bits];   __syncthreads();
+src = blocks[cur_item.snap];
+src.snap_store-&gt;copy_to(group, *block_data.store);
+repeat while has_changed:                                     <span class="c">// several entries can refine the same variable</span>
+  for(i = threadIdx.x; i &lt; k; i += blockDim.x) has_changed |= store.embed(src.snap_dec[i].var, src.snap_dec[i].current());
+thread 0: store.embed(src.snap_dec[k].var, src.snap_dec[k].children[c]);
+          current_strategy = src.snap_root_strategy; next_unassigned_var = src.snap_root_next_unassigned_var;
+<span class="c">// then, as for round 0: depth = 0, fp_engine.reset (#ifndef TURBO_NO_ENTAILED_PROP_REMOVAL), dive s_bits bits, DFS</span></pre>
+<p>This is the backtrack code reading another block's snapshot. No propagation in C' itself: the first <code>propagate()</code> of D (or of F if <code>s = 0</code>) computes the fixpoint of the rebuilt node. The dive inside an item continues with the item's own search strategy; the bits only choose left/right.
+The fixpoint-engine reset is required only with <code>TURBO_NO_ENTAILED_PROP_REMOVAL</code> OFF (a rebuilt item comes from another part of the tree, its entailed set is different); with the option ON (default, and in <code>build/gpu-release</code>) it is compiled out, as before.</p>
+
+<h3>5.4 Memory and launch (l.616–633, l.721–727, l.770–789)</h3>
+<table>
+<tr><th>point</th><th>implemented as</th></tr>
+<tr><td>per-block memory</td><td><code>mem_per_block += store_bytes + sizeof(LightBranch)·MAX_SEARCH_DEPTH + sizeof(FrontierItem)·1024</code> (snapshot store, snapshot stack, item quota)</td></tr>
+<tr><td>cooperative support</td><td><code>cudaDevAttrCooperativeLaunch</code> checked; if absent: warning, <code>restart_idle_pct = 0</code>, old path</td></tr>
+<tr><td>co-residency</td><td>occupancy recomputed <b>with</b> <code>mem_config.shared_bytes</code>: if <code>num_blocks</code> &gt; blocks/SM × SMs, it is reduced (warning, <code>num_blocks</code> re-printed)</td></tr>
+<tr><td>launch</td><td><code>cudaLaunchCooperativeKernel(gpu_barebones_solve, B, CUDA_THREADS_PER_BLOCK, args, shared_bytes, 0)</code>; otherwise the old <code>&lt;&lt;&lt;…&gt;&gt;&gt;</code></td></tr>
+<tr><td>compilation</td><td>nvcc compiles <code>this_grid().sync()</code> without <code>-rdc</code>; kernel 98 registers, no spills</td></tr>
+<tr><td>host</td><td>unchanged: <code>wait_solving_ends</code> only raises <code>stop</code>; restarts are invisible to it</td></tr>
+</table>
+
+<h2 class="pb">6. Splitting: one uniform depth</h2>
+<p>After S3, with <code>n</code> items and <code>T = restart_subfactor·B</code> (1200 with the defaults on 40 blocks), every block computes the smallest <code>s</code> with <code>n·2<sup>s</sup> ≥ T</code> (loop, capped at 40), <code>num_subproblems = n·2<sup>s</sup></code>; index <code>j</code> → item <code>j &gt;&gt; s</code>, dive bits = low <code>s</code> bits of <code>j</code>.</p>
+<figure>
+<svg viewBox="0 0 720 100" role="img" aria-label="Uniform split layout">
+  <text x="4" y="12" class="b">n = 5 items, s = 2: each item owns 4 consecutive indices</text>
+  <g>
+  <rect x="10" y="26" width="136" height="24" fill="#e6f4ec" stroke="var(--r1)"/><text x="16" y="42" class="mono">item 0: j = 0..3</text>
+  <rect x="146" y="26" width="136" height="24" fill="#e6f4ec" stroke="var(--r1)"/><text x="152" y="42" class="mono">item 1: j = 4..7</text>
+  <rect x="282" y="26" width="136" height="24" fill="#e6f4ec" stroke="var(--r1)"/><text x="288" y="42" class="mono">item 2: j = 8..11</text>
+  <rect x="418" y="26" width="136" height="24" fill="#e6f4ec" stroke="var(--r1)"/><text x="424" y="42" class="mono">item 3: j = 12..15</text>
+  <rect x="554" y="26" width="136" height="24" fill="#e6f4ec" stroke="var(--r1)"/><text x="560" y="42" class="mono">item 4: j = 16..19</text>
+  </g>
+  <text x="10" y="72" class="m">j = 10 = 0b10|10 → item 10 &gt;&gt; 2 = 2, dive bits "10": right, then left. A leaf after the first bit: step E jumps to ((10 &gt;&gt; 1) + 1) &lt;&lt; 1 = 12 = the start of item 3.</text>
+  <text x="10" y="88" class="m">The counter restarts at B (block b takes j = b) and is incremented exactly as in round 0 (l.1229). Proposition 2 guarantees E stays aligned on items.</text>
+</svg>
+</figure>
+<table>
+<tr><th>situation (B = 40, T = 1200)</th><th class="n">n</th><th class="n">s</th><th class="n">subproblems</th><th class="n">per block</th></tr>
+<tr><td>round 0 (EPS, <code>s = subproblems_power</code>)</td><td class="n">1</td><td class="n">11</td><td class="n">2,048</td><td class="n">51</td></tr>
+<tr><td>accap ~1000 s, estimated frontier (not measured)</td><td class="n">250–400</td><td class="n">2</td><td class="n">1,000–1,600</td><td class="n">25–40</td></tr>
+<tr><td>late restart, 3 busy blocks</td><td class="n">40</td><td class="n">5</td><td class="n">1,280</td><td class="n">32</td></tr>
+<tr><td>enough items already</td><td class="n">≥ 1200</td><td class="n">0</td><td class="n">n</td><td class="n">≥ 30</td></tr>
+</table>
+<p>Round 0 keeps its own code path for C (copy of the global root) and its own <code>s = subproblems_power</code>, so it is bit-for-bit the old search; rounds ≥ 1 use C'. Extra bits on a small item are cheap: E skips the dead branches as soon as the dive meets a leaf.</p>
+
+<h2>7. Changes outside the restart logic</h2>
+<h3>7.1 Bug fix: the E skip could move the counter backwards (l.1043–1050)</h3>
+<pre><span class="c">// before</span>  while(grid_data-&gt;next_subproblem.meet(ZLB(next_subproblem_idx))) {}
+<span class="c">// now</span>     grid_data-&gt;next_subproblem.atomic().fetch_max(next_subproblem_idx, relaxed);</pre>
+<p><code>meet</code> loads the counter, compares, stores. If between the load and the store other blocks take indices with <code>atomic()++</code> past <code>next_subproblem_idx</code>, the store writes a <b>smaller</b> value: those indices are handed out a second time (duplicated work, and duplicated <code>eps_solved_subproblems</code>/<code>nodes</code> counts). Found while verifying the restarts; <code>fetch_max</code> is a single atomic and monotone. This also changes the non-restart path.</p>
+<h3>7.2 <code>stop_after_n_nodes</code> stops the grid (l.1580)</h3>
+<p>With <code>-restart</code>, reaching the node limit sets <code>unified_data.stop</code>, so the exit is grid-uniform (deadlock rule 3). Without <code>-restart</code> the old per-block behaviour is kept.</p>
+<h3>7.3 Solved-subproblem count (l.1215–1220)</h3>
+<p><code>eps_solved_subproblems</code> is incremented only if <code>!open_subproblem</code>: a subproblem interrupted by a restart is not solved; its remainder is counted by the items that finish it.</p>
+
+<h2 class="pb">8. Statistics</h2>
+<table>
+<tr><th>statistic</th><th>meaning</th></tr>
+<tr><td><code>tree_nodes</code>, <code>tree_failures</code></td><td>nodes of the search tree counted once. A dive node at <code>remaining_depth = rd</code> is shared by all indices with the same high bits; only the index whose low <code>rd</code> bits are 0 counts it (l.985), which is also the first one to reach it (E jumps to aligned starts). Every DFS node counts (<code>in_tree = true</code>, F). Printed in both modes</td></tr>
+<tr><td><code>redundant_dive_nodes</code></td><td><code>nodes − tree_nodes</code>: dive nodes recomputed by several subproblems (EPS overhead)</td></tr>
+<tr><td><code>restarts</code></td><td>restarts that redistributed work (<code>n &gt; 0</code>); also the counter checked by <code>-restart_max</code></td></tr>
+<tr><td><code>restart_items_sum/max/last</code></td><td>items published per restart</td></tr>
+<tr><td><code>restart_subproblems_sum</code>, <code>restart_s_max</code></td><td><code>Σ n·2<sup>s</sup></code> and the largest <code>s</code></td></tr>
+<tr><td><code>restart_truncated_blocks</code></td><td>blocks that hit the item quota (should be 0)</td></tr>
+<tr><td><code>restart_drain_ms_avg/max</code></td><td>flag raised → block 0 past S1 (time for every busy block to finish its node)</td></tr>
+<tr><td><code>restart_first_sec</code>, <code>restart_last_sec</code></td><td>kernel time of the first/last raise</td></tr>
+<tr><td>ENR idle</td><td>the waits from S1-arrival to S3-exit are recorded per block (up to 256 intervals, <code>enr_wait_*</code>) and added to <code>enr_idle_ns_sum</code> and to the idle-per-slice timeline; a block waiting at the end of a slice is not counted busy</td></tr>
+</table>
+<p>Invariant used for testing: <b>for a complete search with the same tree, <code>tree_nodes</code> must be identical with and without restarts</b>. For pigeonhole <code>php(n)</code> (UNSAT, no pruning by a bound) the tree has <code>2·n! − 1</code> nodes.</p>
+
+<h2>9. Correctness and verification</h2>
+<ul>
+<li><b>Completeness:</b> at S1 every unexplored node is in exactly one item (Prop. 1 per block, disjoint subproblems across blocks, counter exhausted); each item is partitioned by the uniform split (Prop. 2); E skips only subtrees whose root is a leaf; truncation only enlarges items.</li>
+<li><b>Optimality:</b> refutations are relative to bounds that only decrease; the next round starts with the exact minimum.</li>
+<li><b>Termination:</b> every busy block finishes at least its current node before stopping, and each restart needs <code>T<sub>min</sub></code> and at least ⌈P·B/100⌉ idle blocks; <code>-restart_max</code> bounds the number of restarts. A round with no busy block publishes <code>n = 0</code> and everyone exits.</li>
+<li><b>No deadlock:</b> §3.2 rules; exit values are grid-uniform.</li>
+</ul>
+<table>
+<tr><th>test (2026-11-17, RTX 4050, 40 blocks)</th><th>result</th></tr>
+<tr><td><code>benchmarks/enr_small/run_tests.py</code></td><td>12/12 without and with <code>-restart</code></td></tr>
+<tr><td>php8, php9, php10, with/without restarts</td><td><code>tree_nodes = 2·n! − 1</code> in all 15/15 runs: no node lost or duplicated</td></tr>
+<tr><td>php10, <code>-restart 3..10 -restart_min_ms 0</code></td><td>7.7 s → 2.4 s</td></tr>
+<tr><td>golomb10, same options</td><td>13.9 s → 5.9 s</td></tr>
+<tr><td>accap / wordpress 1000–2000 s vs 2026-11-11 baselines</td><td><b>pending</b> (no results recorded in this document)</td></tr>
+</table>
+
+<div class="later"><h3 style="margin-top:2px">10. Not implemented, can be added later</h3>
+<ul>
+<li><b>S2 barrier</b> for a shallowest-first sort over all items and per-item depths <code>s<sub>i</sub></code> (prefix sums, binary search for <code>j</code> → item, offset-relative E skip). Today items are handed out in harvest order; within one block they are already shallowest first. Add it if long runs show large items starting late in a round.</li>
+<li><b>Forced restarts</b> (timer / debug mode): would need <code>!restart</code> in the loop condition and in G (§3.1).</li>
+<li>The truncation path has never been triggered in tests.</li>
+</ul></div>
+
+<h3>References</h3>
+<ul>
+<li>J.-C. Régin, M. Rezgui, A. Malapert, "Embarrassingly Parallel Search", CP 2013.</li>
+<li>C. Lecoutre, L. Sais, S. Tabary, V. Vidal, "Recording and Minimizing Nogoods from Restarts", JSAT 1 (2007) — Prop. 1–2 (nld-nogoods), <code>jsat07.pdf</code>.</li>
+<li>P. Talbot, "A GPU-based Constraint Programming Solver", AAAI 2026 (Turbo 1.2.8, EPS variant, idle blocks at the end).</li>
+<li>NVIDIA CUDA Programming Guide, Cooperative Groups: grid synchronization and cooperative launch.</li>
+<li><code>RESTART_STRATEGY.pdf</code>, <code>NOGOOD_RESTART_DESIGN.pdf</code> (restart types A/B).</li>
+</ul>
+
+</body></html>

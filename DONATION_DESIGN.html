@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Work Donation Design</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 16mm 15mm; }
+  :root { --ink:#1b1f24; --mute:#57606a; --line:#d0d7de; --accent:#0b5cad; --soft:#f3f6fa; --warn:#9a3b00; }
+  body { font-family: "DejaVu Sans", "Helvetica Neue", Arial, sans-serif; font-size: 9.6pt; line-height: 1.42; color: var(--ink); background:#fff; margin:0; }
+  h1 { font-size: 17pt; margin: 0 0 2mm; }
+  h2 { font-size: 12pt; margin: 6mm 0 2mm; color: var(--accent); border-bottom: 1px solid var(--line); padding-bottom: 1mm; break-after: avoid; }
+  h3 { font-size: 10.2pt; margin: 4mm 0 1.5mm; break-after: avoid; }
+  p { margin: 1.5mm 0; }
+  .sub { color: var(--mute); margin-bottom: 4mm; }
+  code, pre { font-family: "DejaVu Sans Mono", Menlo, monospace; font-size: 8.4pt; }
+  code { background: var(--soft); padding: 0 2px; border-radius: 2px; }
+  pre { background: var(--soft); border: 1px solid var(--line); border-radius: 3px; padding: 2.2mm 3mm; white-space: pre-wrap; margin: 2mm 0; break-inside: avoid; }
+  table { border-collapse: collapse; width: 100%; margin: 2mm 0; break-inside: avoid; }
+  th, td { border: 1px solid var(--line); padding: 1.1mm 1.8mm; vertical-align: top; text-align: left; }
+  th { background: var(--soft); font-weight: 600; }
+  .box { border: 1px solid var(--line); border-left: 3px solid var(--accent); background: #fbfcfe; padding: 2mm 3mm; margin: 2.5mm 0; break-inside: avoid; }
+  .warn { border-left-color: var(--warn); }
+  ul, ol { margin: 1mm 0 1mm 5mm; padding-left: 3mm; }
+  li { margin: 0.6mm 0; }
+  .refs li { margin: 1.1mm 0; }
+  .small { font-size: 8.4pt; color: var(--mute); }
+  svg text { font-family: "DejaVu Sans", Arial, sans-serif; }
+  .pb { break-before: page; }
+</style>
+</head>
+<body>
+
+<h1>Work donation without grid synchronisation</h1>
+<div class="sub">Design note for Turbo 1.2.8 barebones (restart branch) &middot; 2026-11-19 &middot; <b>proposal, not implemented</b>.
+Line numbers refer to <code>include/barebones_dive_and_solve.hpp</code> as of today.</div>
+
+<div class="box">
+<b>In one paragraph.</b> Today the restart repartitions the work globally: every block stops, harvests its open nodes under
+<code>grid.sync()</code> (S1), block 0 resets the round, and everyone restarts after a second <code>grid.sync()</code> (S3).
+The barrier is needed only because the reset is <i>non-monotone</i> (the counter goes back to B, the flag and <code>idle_blocks</code> go back to 0).
+Work donation replaces this global step by <b>local, one-at-a-time transfers</b>: an idle block posts a request in its own slot;
+any busy block, at the safe point it already has at the end of each node, claims the slot with one CAS, copies its
+<b>shallowest open node</b> into it, and marks that node as given away. Nothing is ever reset, so there is
+<b>no barrier, no round, no restart threshold and no cooperative launch</b>. All shared data is either a lattice element updated
+monotonically (bound, EPS counter) or a slot owned by exactly one block at a time.
+</div>
+
+<h2>1. What is already barrier-free, and what is not</h2>
+<table>
+<tr><th>contact between blocks</th><th>where</th><th>operation</th><th>barrier?</th></tr>
+<tr><td>next EPS subproblem</td><td>l.1251 <code>next_subproblem.atomic()++</code></td><td>increasing counter (chain)</td><td>no</td></tr>
+<tr><td>skip of a refuted subtree</td><td>l.1067 <code>fetch_max</code></td><td>max on a chain</td><td>no</td></tr>
+<tr><td>best bound</td><td><code>appx_best_bound</code> meet in <code>propagate()</code></td><td>meet (monotone)</td><td>no</td></tr>
+<tr><td>host stop / node limit</td><td><code>unified_data-&gt;stop</code></td><td>flag that only goes up</td><td>no</td></tr>
+<tr><td>restart: harvest + reset</td><td>l.1263&ndash;1410 (S1, S3)</td><td>stacks frozen, counter/flag <b>reset</b></td><td><b>yes, 2&times;</b></td></tr>
+</table>
+<p>Without <code>-restart</code> the kernel never reaches a barrier (it leaves at l.1263). The tree search proper is already
+lattice-style; the two <code>grid.sync()</code> exist only to make the global reset safe. Donation removes the reset itself.</p>
+
+<h2>2. Shared state</h2>
+<table>
+<tr><th>datum</th><th>kind</th><th>written by</th><th>operation</th><th>status</th></tr>
+<tr><td><code>appx_best_bound</code></td><td>meet-semilattice</td><td>any block</td><td>meet</td><td>exists</td></tr>
+<tr><td><code>next_subproblem</code> (EPS pool)</td><td>chain</td><td>any block</td><td><code>fetch_add</code> / <code>fetch_max</code></td><td>exists</td></tr>
+<tr><td><code>slot_state[r]</code>, one per block r</td><td>4-state cycle</td><td>receiver r / one donor</td><td>store / CAS</td><td>new</td></tr>
+<tr><td>slot payload of r</td><td>store + decision prefix</td><td>the donor that won the CAS</td><td>plain writes, then release</td><td>reuse <code>snap_store</code>, <code>snap_dec</code></td></tr>
+<tr><td><code>requests</code></td><td>counter</td><td>receivers (+1), donors (&minus;1)</td><td><code>fetch_add</code></td><td>new (replaces <code>restart_flag</code>)</td></tr>
+<tr><td><code>active</code></td><td>counter, init B</td><td>blocks</td><td><code>fetch_add</code>/<code>fetch_sub</code></td><td>new (replaces <code>idle_blocks</code>)</td></tr>
+<tr><td><code>donated[k]</code> (per block, per level)</td><td>local flag</td><td>the block itself only</td><td>plain</td><td>new, private</td></tr>
+</table>
+<p>The victim's stack is <b>never read by another block</b>: the donor copies from its own stack into the receiver's slot.
+That is the main difference with stealing (thief reads the victim), and it removes all version/ABA problems.</p>
+
+<h2>3. The slot protocol</h2>
+<svg viewBox="0 0 720 160" width="100%" role="img" aria-label="slot state machine">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0b5cad"/></marker></defs>
+  <g font-size="12">
+    <rect x="10"  y="45" width="110" height="38" rx="5" fill="#f3f6fa" stroke="#0b5cad"/><text x="65"  y="69" text-anchor="middle" font-weight="bold">EMPTY</text>
+    <rect x="200" y="45" width="120" height="38" rx="5" fill="#f3f6fa" stroke="#0b5cad"/><text x="260" y="69" text-anchor="middle" font-weight="bold">REQUESTED</text>
+    <rect x="400" y="45" width="110" height="38" rx="5" fill="#f3f6fa" stroke="#0b5cad"/><text x="455" y="69" text-anchor="middle" font-weight="bold">CLAIMED</text>
+    <rect x="590" y="45" width="110" height="38" rx="5" fill="#f3f6fa" stroke="#0b5cad"/><text x="645" y="69" text-anchor="middle" font-weight="bold">FILLED</text>
+    <line x1="120" y1="64" x2="198" y2="64" stroke="#0b5cad" marker-end="url(#a)"/>
+    <text x="159" y="40" text-anchor="middle" font-size="10">receiver r: store</text>
+    <line x1="320" y1="64" x2="398" y2="64" stroke="#0b5cad" marker-end="url(#a)"/>
+    <text x="359" y="34" text-anchor="middle" font-size="10">one donor:</text><text x="359" y="46" text-anchor="middle" font-size="10">CAS (exclusive)</text>
+    <line x1="510" y1="64" x2="588" y2="64" stroke="#0b5cad" marker-end="url(#a)"/>
+    <text x="549" y="34" text-anchor="middle" font-size="10">donor: copy,</text><text x="549" y="46" text-anchor="middle" font-size="10">fence, store</text>
+    <path d="M645,83 C645,135 65,135 65,85" fill="none" stroke="#0b5cad" marker-end="url(#a)"/>
+    <text x="355" y="152" text-anchor="middle" font-size="10">receiver r: consume payload (replay), then store EMPTY</text>
+    <line x1="260" y1="45" x2="260" y2="12" stroke="#9a3b00" stroke-dasharray="3,2" marker-end="url(#a)"/>
+    <text x="268" y="14" font-size="10" fill="#9a3b00">active == 0 or stop: exit (search over)</text>
+  </g>
+</svg>
+<p>Each slot is <b>owned by its receiver</b> (slot index = <code>blockIdx.x</code> of the idle block), so no allocation is needed and at most one
+request per block exists. CLAIMED &rarr; FILLED is a promise: a donor claims only when it has already chosen the level to give, so filling cannot fail.</p>
+
+<h3>3.1 Receiver (block r becomes idle)</h3>
+<pre>// thread 0, when its subproblem is finished and next_subproblem is exhausted
+active.fetch_sub(1);                         // I hold no work any more
+slot_state[r].store(REQUESTED, release);
+requests.fetch_add(1);
+loop:
+  s = slot_state[r].load(acquire);
+  if (s == FILLED) break;                    // work arrived
+  if (s == REQUESTED &amp;&amp; active.load() == 0) -&gt; leave the kernel loop (all idle, nothing in flight)
+  if (stop) -&gt; leave
+  __nanosleep(backoff);                      // ~1 us: do not hammer L2 while others work
+__syncthreads();
+// all threads: rebuild the donated node, same code as today's C' (l.939-975) with src = slot r
+slot_store[r] -&gt; store;  embed slot_dec[0..k-1].current();  embed slot_dec[k].children[1];
+strategy = slot_root_strategy[r]; next_unassigned_var = slot_root_next_var[r];
+thread 0: slot_state[r].store(EMPTY);        // payload consumed, slot reusable
+// continue as a normal subproblem with s_bits = 0 (no dive); root_store is taken at depth 0 as today</pre>
+
+<h3>3.2 Donor (busy block, at the end of every node)</h3>
+<p>Placed where the restart check is today (l.1225): the last split or backtrack is embedded but not propagated, the stack is consistent, nothing is half-done.</p>
+<pre>// thread 0
+if (requests.load(relaxed) &gt; 0) {                       // same cost as today's restart_flag poll (l.1610)
+  k = shallowest level with decisions[k].current_idx == 0 &amp;&amp; !donated[k] &amp;&amp; k &lt;= depth-1-G;
+  if (k exists)
+    for r in slots, starting at (blockIdx.x+1) mod B:    // spread donors over receivers
+      if (slot_state[r] == REQUESTED &amp;&amp; CAS(slot_state[r], REQUESTED, CLAIMED)) { won = true; break; }
+  if (won) { requests.fetch_sub(1); active.fetch_add(1); donated[k] = true; }   // +1 on behalf of r
+}
+__syncthreads();
+if (won) {                                               // all threads: same code as today's harvest copy (l.1288-1299)
+  root_store -&gt; slot_store[r];   decisions[0..k] -&gt; slot_dec[r];
+  thread 0: slot_k[r] = k; slot_root_strategy[r] = snapshot_root_strategy; slot_root_next_var[r] = snapshot_next_unassigned_var;
+  __threadfence(); __syncthreads();
+  thread 0: slot_state[r].store(FILLED, release);
+}</pre>
+
+<h3>3.3 The donor never explores what it gave away</h3>
+<p>Backtracking follows ropes (l.1161): the target depth <code>d</code> means &ldquo;go to level <code>d-1</code> and take its right child&rdquo;.
+The donated level must be skipped, but <code>current_idx</code> must <b>not</b> be changed: the donor is still inside the <i>left</i> subtree of level k,
+and every redescend re-applies <code>decisions[i].current()</code> (l.1196), so setting <code>current_idx = 1</code> would move it into the given-away subtree.
+Instead, the backtrack follows the rope past donated levels:</p>
+<pre>d = decisions[depth-1].ropes[decisions[depth-1].current_idx];       // as today
+while (d != -1 &amp;&amp; donated[d-1]) d = decisions[d-1].ropes[1];        // its right subtree belongs to someone else
+// push_decision (l.458): donated[depth] = false;  (a re-pushed level is a new decision)</pre>
+<p>The rope of level <code>d-1</code>'s right child (<code>ropes[1]</code>) is exactly where the donor would have gone after finishing that subtree,
+so the donor continues as if the subtree had been explored and found empty.</p>
+
+<h2>4. Termination</h2>
+<p><code>active</code> counts the blocks that hold work, <b>plus</b> donations in flight: a donor adds 1 for its receiver right after winning the CAS,
+while it is itself still counted, so <code>active</code> never touches 0 while a transfer is in progress. Hence:</p>
+<ul>
+<li><code>active == 0</code> &rArr; no block holds work and no slot is CLAIMED/FILLED &rArr; the search is complete.</li>
+<li><code>active == 0</code> is <b>stable</b>: nobody holds work, so nobody can donate, so it never goes back up.</li>
+<li>Each idle block detects it on its own while polling its slot; no block waits for another to leave.</li>
+</ul>
+<p>This is the shared-memory form of credit/weight-based distributed termination detection (Mattern 1987). If one prefers only monotone counters,
+the same predicate is <code>finished == B + given</code> with two increasing counters packed in one 64-bit word (one <code>fetch_add</code>, atomic snapshot).</p>
+
+<h2>5. Invariants and race cases</h2>
+<table>
+<tr><th>invariant</th><th>why it holds</th></tr>
+<tr><td><b>I1 coverage</b>: remaining space = EPS pool &cup; every block's remaining subtree (minus donated levels) &cup; CLAIMED/FILLED slots</td>
+<td>a donated subtree leaves the donor (<code>donated[k]</code>, skipped by 3.3) at the same moment it enters exactly one slot (CAS won)</td></tr>
+<tr><td><b>I2 exclusivity</b>: every open node has exactly one owner</td><td>CAS on the slot: one donor per request; one slot per claim; the donor's stack is written only by itself</td></tr>
+<tr><td><b>I3 visibility</b>: the receiver reads a complete payload</td><td>payload writes &rarr; <code>__threadfence</code> &rarr; release store FILLED; receiver: acquire load &rarr; <code>__syncthreads</code></td></tr>
+<tr><td><b>I4 termination</b></td><td>section 4</td></tr>
+<tr><td><b>I5 soundness</b></td><td>bound only tightens (meet); a solution found anywhere is valid; a pruned prefix on replay means an empty subtree, correctly</td></tr>
+</table>
+<table>
+<tr><th>race</th><th>outcome</th></tr>
+<tr><td>two donors see the same request</td><td>one CAS wins, the other continues its own search (or tries another slot)</td></tr>
+<tr><td>donor finishes its subtree right after donating</td><td>it decrements <code>active</code> only for itself; the +1 for the receiver stays</td></tr>
+<tr><td>receiver sees <code>active == 0</code> while its slot is REQUESTED</td><td>correct exit: no donor can exist (a donor is counted in <code>active</code>)</td></tr>
+<tr><td>host stop / node limit while a slot is CLAIMED</td><td>everyone leaves on <code>stop</code>; the search is incomplete anyway, as today</td></tr>
+<tr><td>receiver reuses its slot</td><td>it stores EMPTY only after the payload is in its own store (after <code>__syncthreads</code>)</td></tr>
+<tr><td>bound read during replay is older than the donor's</td><td>harmless: the bound is re-read at every fixpoint; replay with a looser bound only explores more</td></tr>
+</table>
+
+<div class="box warn"><b>Node identity: decisions, not bits.</b> The donated node is described by its <i>actual decisions</i> (variable + child domain per level),
+exactly like today's harvest items <code>(snap, k, c)</code>. It must not be identified by a left/right bitstring: with a tighter bound,
+propagation changes and the branching heuristic may pick another variable at the same depth, so the same bits would denote a different node and coverage would break.</div>
+
+<h2>6. Costs, with numbers from the A100 runs (accap_a3, 216 blocks)</h2>
+<table>
+<tr><th>item</th><th>value</th><th>source</th></tr>
+<tr><td>poll per node (busy block)</td><td>1 relaxed load, as <code>restart_flag</code> today</td><td>l.1610</td></tr>
+<tr><td>receiver's wait for a donor</td><td>&le; one donor node: avg 233&ndash;252 &micro;s, rare max ~2 ms</td><td><code>enr_node_time_us_avg</code>, fixpoint histogram</td></tr>
+<tr><td>donor's copy</td><td>store 12,168 B + prefix (&le; 237 levels) by 256 threads: a few &micro;s</td><td><code>store_mem</code>, <code>peakDepth</code></td></tr>
+<tr><td>receiver's replay</td><td>like one backtrack: ~290&ndash;320 &micro;s</td><td><code>enr_backtrack_whole_us_avg</code></td></tr>
+<tr><td>memory</td><td>one slot per block = today's <code>snap_store</code> + <code>snap_dec</code>, re-indexed by receiver; <code>items</code> no longer needed</td><td><code>mem_per_block</code> 846 KB with restart</td></tr>
+<tr><td>idle to beat</td><td>none 71.6 % &middot; restart 30: 10.1 % &middot; restart 20: 2.0 % (1000 s)</td><td>MeluXina T1000 logs</td></tr>
+</table>
+<p>Expected effect: no waiting for a threshold, no stop of busy blocks. Idle time should remain only at the very end, when the remaining subtrees are
+smaller than what is worth donating (the same tail limit the restart has). The gap <code>G</code> (do not donate a level too close to the current node)
+is the one tuning knob; the receiver's replay (~0.3 ms) is the minimum size a donated subtree should have.</p>
+
+<h2>7. What would change in the code (map only)</h2>
+<table>
+<tr><th>today</th><th>with donation</th></tr>
+<tr><td>S1 / harvest / reset / S3 (l.1263&ndash;1410), the <code>while(true)</code> round loop</td><td>removed; replaced by the receiver loop of 3.1</td></tr>
+<tr><td>cooperative launch + residency check (l.628, l.782&ndash;800)</td><td>not needed (normal <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> launch)</td></tr>
+<tr><td>restart trigger in <code>propagate()</code> (l.1610&ndash;1630)</td><td><code>requests</code> poll + donor claim (3.2)</td></tr>
+<tr><td><code>if(restart) break;</code> (l.1225)</td><td>donor action site (3.2), no break</td></tr>
+<tr><td>harvest copy (l.1288&ndash;1299)</td><td>fill-slot copy (same loop, destination = slot r)</td></tr>
+<tr><td>item replay C' (l.939&ndash;975)</td><td>slot replay (same loop, source = slot r)</td></tr>
+<tr><td>rope backtrack (l.1161), <code>push_decision</code> (l.458)</td><td>skip donated levels; clear <code>donated[depth]</code> on push</td></tr>
+<tr><td>flags <code>-restart*</code>, stats <code>restart_*</code></td><td><code>-donate</code>, <code>-donate_gap G</code>; stats: donations, wait per request, donated depth, replay time</td></tr>
+</table>
+
+<h2>8. Open points</h2>
+<ul>
+<li><b>Best bound.</b> The barrier recomputed the exact minimum (l.1347), repairing the racy meet of <code>appx_best_bound</code>. Without barriers
+  only the monotone meet remains; an atomic <code>fetch_min</code> would make it exact (a change to upstream code: to be decided separately).</li>
+<li><b>Which level to donate.</b> Shallowest open level (largest subtree) is the classic choice (Rao &amp; Kumar; Schulte). A confidence-based choice
+  (Chu, Schulte &amp; Stuckey) is a later refinement.</li>
+<li><b>EPS size.</b> With dynamic balancing the initial 2<sup>13</sup> subproblems may be reducible (fewer dives, less <code>redundant_dive_nodes</code>): an experiment.</li>
+<li><b>Request discovery.</b> A slot scan (&le; 216 loads) only when <code>requests &gt; 0</code>; a monotone ticket queue (two increasing counters) is an alternative.</li>
+<li><b>Before code:</b> run <code>-restart 1</code> and <code>-restart 5</code>; if idle already drops to ~0 % with negligible overhead, the gain left for donation is the stop of busy blocks only.</li>
+</ul>
+
+<h2>9. Where this has been done</h2>
+<p><b>Short answer:</b> receiver-initiated donation with polling at safe points is an established technique on CPUs (parallel DFS since the late 1980s,
+work stealing with <i>private</i> deques in 2013), and donation/stealing between persistent blocks has been studied on GPUs (rendering, branch-and-bound).
+I did not find a GPU constraint solver that balances its search tree between blocks this way, nor one that frames it with lattice-monotone shared state.</p>
+<table>
+<tr><th>work</th><th>what is close to this design</th></tr>
+<tr><td>Acar, Charguéraud, Rainey, PPoPP 2013</td><td><b>Closest scheme.</b> Work stealing with private deques: the victim's deque is never accessed by others;
+thieves post requests, the victim polls and hands over work. A receiver-initiated and a sender-initiated variant, with bounds similar to concurrent-deque work stealing.</td></tr>
+<tr><td>Rao &amp; Kumar 1987; Kumar, Grama, Rao 1994</td><td>Parallel depth-first search: idle processors request work, the donor splits its stack (nodes near the root), plus termination detection.</td></tr>
+<tr><td>Eager, Lazowska, Zahorjan 1986</td><td>Receiver-initiated vs sender-initiated load sharing: the receiver-initiated form (requests from idle nodes) wins under high load, as here.</td></tr>
+<tr><td>Tzeng, Patney, Owens, HPG 2010</td><td>GPU, persistent blocks: task stealing and task donation queues have &gt;100&times; less idle time than centralised/distributed queues; donation preferred (same speed, less memory).</td></tr>
+<tr><td>Cederman &amp; Tsigas, Graphics Hardware 2008</td><td>GPU load balancing compared: blocking/non-blocking queues vs work stealing with lock-free deques.</td></tr>
+<tr><td>Gmys, Mezmaz, Melab, Tuyttens, PPAM 2015 / ParCo 2016 / CCPE 2017</td><td>GPU branch-and-bound fully on the GPU, work stealing inside the GPU with an interval encoding (IVM) of the search tree; hierarchical stealing on multi-GPU.</td></tr>
+<tr><td>Jenkins et al., Euro-Par 2011</td><td>Backtracking on the GPU: load-balanced work distribution is one of the key lessons.</td></tr>
+<tr><td>Schulte 2000; Chu, Schulte, Stuckey CP 2009</td><td>CP on CPUs: work stealing of the node closest to the root; confidence-based choice of what to steal.</td></tr>
+<tr><td>Régin, Rezgui, Malapert CP 2013; Malapert et al. JAIR 2016</td><td>Embarrassingly Parallel Search: the static decomposition Turbo uses for its first phase.</td></tr>
+<tr><td>Talbot, Pinel, Bouvry AAAI 2022; Talbot AAAI 2026</td><td>Turbo: concurrent constraint programming on GPU with lattice-monotone shared data; the EPS + barebones design this note extends.</td></tr>
+</table>
+
+<h3>References</h3>
+<ol class="refs small">
+<li>U. A. Acar, A. Charguéraud, M. Rainey. <i>Scheduling parallel programs by work stealing with private deques.</i> PPoPP 2013. doi:10.1145/2442516.2442538</li>
+<li>V. N. Rao, V. Kumar. <i>Parallel depth first search. Part I: Implementation.</i> Int. J. Parallel Programming 16(6), 1987.</li>
+<li>V. Kumar, A. Grama, V. N. Rao. <i>Scalable load balancing techniques for parallel computers.</i> J. Parallel and Distributed Computing 22(1), 1994.</li>
+<li>D. L. Eager, E. D. Lazowska, J. Zahorjan. <i>A comparison of receiver-initiated and sender-initiated adaptive load sharing.</i> Performance Evaluation 6(1), 1986.</li>
+<li>S. Tzeng, A. Patney, J. D. Owens. <i>Task management for irregular-parallel workloads on the GPU.</i> High Performance Graphics 2010.</li>
+<li>D. Cederman, P. Tsigas. <i>On dynamic load balancing on graphics processors.</i> Graphics Hardware 2008.</li>
+<li>J. Gmys, M. Mezmaz, N. Melab, D. Tuyttens. <i>IVM-based work stealing for parallel branch-and-bound on GPU.</i> PPAM 2015, LNCS; <i>A GPU-based branch-and-bound algorithm using Integer-Vector-Matrix data structure.</i> Parallel Computing, 2016; <i>IVM-based parallel branch-and-bound using hierarchical work stealing on multi-GPU systems.</i> Concurrency and Computation: Practice and Experience, 2017.</li>
+<li>J. Jenkins, I. Arkatkar, J. D. Owens, A. Choudhary, N. F. Samatova. <i>Lessons learned from exploring the backtracking paradigm on the GPU.</i> Euro-Par 2011, LNCS 6853. doi:10.1007/978-3-642-23397-5_42</li>
+<li>C. Schulte. <i>Parallel search made simple.</i> TRICS workshop (CP 2000).</li>
+<li>G. Chu, C. Schulte, P. J. Stuckey. <i>Confidence-based work stealing in parallel constraint programming.</i> CP 2009, LNCS 5732. doi:10.1007/978-3-642-04244-7_20</li>
+<li>J.-C. Régin, M. Rezgui, A. Malapert. <i>Embarrassingly parallel search.</i> CP 2013; A. Malapert, J.-C. Régin, M. Rezgui. <i>Embarrassingly parallel search in constraint programming.</i> JAIR 57, 2016.</li>
+<li>F. Mattern. <i>Algorithms for distributed termination detection.</i> Distributed Computing 2(3), 1987.</li>
+<li>D. Chase, Y. Lev. <i>Dynamic circular work-stealing deque.</i> SPAA 2005 (the stealing alternative, not used here).</li>
+<li>P. Talbot, F. Pinel, P. Bouvry. <i>A variant of concurrent constraint programming on GPU.</i> AAAI 2022; P. Talbot. <i>A GPU-based constraint programming solver.</i> AAAI 2026.</li>
+</ol>
+<p class="small">Some page and volume details were taken from publisher/DBLP records found today; the GPU branch-and-bound author lists differ slightly between sources.</p>
+
+</body>
+</html>

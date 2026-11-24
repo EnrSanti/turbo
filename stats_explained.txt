@@ -1,0 +1,291 @@
+TURBO BAREBONES STATISTICS - WHAT EACH LINE MEANS
+==================================================
+Reference run: accap_a3, -t 180000 -or 40 (2026-11-10). The worked numbers below come from it
+(the ENR values are recomputed with the new names, introduced on 2026-11-10).
+Sources: include/statistics.hpp, include/config.hpp, include/barebones_dive_and_solve.hpp,
+         include/common_solving.hpp, include/memory_gpu.hpp (local copy of Turbo 1.2.8).
+
+
+0. THE TIME BASES (read this first)
+-----------------------------------
+Every time or percentage is measured against one of these bases. Mixing them up is the main source of confusion.
+
+ [H] HOST WALL CLOCK, WHOLE PROGRAM
+     Measured by the CPU (std::chrono::steady_clock) from the start of barebones_dive_and_solve():
+     includes CUDA initialization, parsing and preprocessing, GPU setup, the kernel, and printing.
+     Examples: solveTime, enr_prog_*.
+
+ [K] KERNEL = num_blocks BLOCK SLOTS x KERNEL TIME
+     Kernel time = enr_kernel_time_sec = the longest block lifetime (the kernel ends with the last block).
+     Available block-time = num_blocks x kernel time. Every enr_kernel_pct_* is a share of it, and
+        fixpoint + search_split_other + backtrack_restore + leaf_check + idle = 100 %.
+     Idle is the time a slot stays empty after its block has run out of subproblems.
+
+ [B] ONE SINGLE BLOCK
+     Every CUDA block measures its own time on the GPU clock (thread 0 only), from its start_time (just after
+     allocate()) until it leaves the subproblem loop. enr_block_* are averages over the blocks (or min/max).
+     cumulative_time_block = the SUM of the lifetimes (7185.999 s here = 40 x 179.65 s). It is SMALLER than
+     40 x kernel time when blocks exit early (3420 s run: 69,357 instead of 136,795 block-s).
+     The Turbo stats printed with print_block_timing_stat() (statistics.hpp:340) are per-block averages too:
+     solve_time, search_time, fixpoint_time, select_fp_functions_time, dive_time, transfer_*, wait_cpu_time.
+
+ [N] ONE SINGLE NODE, IN THE BLOCK THAT COMPUTES IT
+     enr_node_*: averages over all nodes. "169.68 us per node" = the time ONE block spends on ONE node.
+     It is NOT a GPU-wide rate: for the GPU-wide rate use enr_kernel_nodes_per_sec.
+
+How the block time is split (the TIMEPOINT chain):
+     Thread 0 of each block keeps a "timer". TIMEPOINT(X) adds (now - timer) to phase X and restarts the timer.
+     So a block's life is cut into consecutive, non-overlapping slices:
+        ... [split/other] TIMEPOINT(SEARCH) [fixpoint] TIMEPOINT(FIXPOINT) [leaf check] TIMEPOINT(SELECT_FP_FUNCTIONS)
+            [split/other] ... [restore on backtrack] TIMEPOINT(BACKTRACK_ENR) ...
+     SEARCH + FIXPOINT + SELECT_FP_FUNCTIONS + BACKTRACK_ENR = (almost) the whole block lifetime.
+     DIVE is the exception: it is a separate timer around the whole dive, so it OVERLAPS the others
+     (the fixpoints done during the dive are also counted in FIXPOINT).
+
+
+1. CONFIGURATION (what was asked on the command line; printed by Configuration::print_mzn_statistics, config.hpp:236)
+-------------------------------------------------------------------------------------------------------
+or_nodes=40                               -or: the number of blocks requested. 0 = automatic (blocks/SM x SMs).
+
+3. SEARCH COUNTERS (summed over the 40 blocks by reduce_blocks)
+----------------------------------------------------------------
+nodes=42349066          The number of calls to propagate(), i.e. nodes whose fixpoint was computed.
+                        It includes the dive nodes (11 per subproblem, about 16k here: negligible).
+failures=21166669       Nodes whose fixpoint ended in bot (failure). About nodes/2: in a binary tree where almost every
+                        branch ends in a failure, about 1 node in 2 fails.
+peakDepth=94            The maximum search depth reached, counted from the SUBPROBLEM ROOT (block_data.depth).
+                        The 11 dive levels are NOT included (the dive does not record decisions). Absolute depth ~ 94 + 11.
+
+num_solutions=63        The number of times a block found a solution better than ITS OWN best bound (block_data.best_bound),
+                        summed over blocks. Blocks also prune with the global bound, so this is close to the number of
+                        improving solutions, but a block can count a solution that another block had already beaten.
+                        Only the final best solution is printed.
+
+eps_num_subproblems=2048     2^subproblems_power
+
+eps_solved_subproblems=1491  Subproblems whose whole subtree was explored, without interruption, those still running at the timeout are not counted.
+
+eps_skipped_subproblems=0    Subproblems skipped because a fixpoint failed during the dive (step E). Counted once per skipped
+                             subtree, by the block whose idx has all its low bits at 0.
+
+num_blocks_done=0            Blocks that left the subproblem loop because there were no subproblems left (not because of
+                             stop). 0 = all 40 were still working at the timeout. In the 3420 s run: 28.
+
+fixpoint_iterations=657964028  The total number of BLOCK-LEVEL ROUNDS (one round = every thread runs its share of the
+                             1640 propagators, then __syncthreads). Per node, ON AVERAGE: 657964028 / 42349066 = 15.54 rounds
+                             (some nodes need 2 rounds, others 40).
+
+num_deductions=1786172542624   The number of propagator executions. With WAC1 a round has two levels:
+                             1) The block splits the propagators into groups of 32: 1640 is padded to 1664 (the 24 extra lanes
+                                repeat propagator 1639), so 1664 / 32 = 52 groups per round
+                                (warps 0-3 handle 7 groups each, warps 4-7 handle 6 each).
+                             2) Each warp repeats ITS group (warp_fixpoint, lala fixpoint.hpp:414) until no lane changes
+                                a domain. One pass = 32 deductions; there is always at least 1 pass.
+                             Counted as (number of passes of every warp) x 32 (barebones propagate(), WAC1 branch).
+                             Per node: minimum (1 pass per group) = 15.54 rounds x 1664 = 25,859; measured = 42,177;
+                             so on average each group of 32 runs 42,177 / 25,859 = 1.63 times per round. The extra 0.63
+                             is the warp-local propagation that WAC1 adds (it saves block rounds and their __syncthreads).
+                             (With AC1 there is no inner loop: it would be rounds x 1640.)
+
+
+5. ENR [kernel]: THE SOLVE KERNEL AS A WHOLE  (base [K] = 40 slots x kernel time)
+----------------------------------------------------------------------------------
+enr_kernel_time_sec=179.650             The duration of the kernel's search: the longest block lifetime.
+enr_kernel_pct_fixpoint=94.38           Fixpoint time (all blocks) / (40 x kernel time).
+enr_kernel_pct_search_split_other=3.03  Split (choosing the variable, push_decision), embedding the decision, tightening the
+                                        objective bound, loop control and its __syncthreads.
+enr_kernel_pct_backtrack_restore=2.15   Copying root_store + re-embedding the path decisions + the right branch.
+                                        The fixpoint that follows is in enr_kernel_pct_fixpoint.
+enr_kernel_pct_leaf_check=0.43          The check after every fixpoint: "are all propagators entailed?" (solution test,
+                                        iprop.ask in parallel) and the solution bookkeeping (Timer::SELECT_FP_FUNCTIONS).
+enr_kernel_pct_idle=0.0001              Empty slots: sum over blocks of (kernel time - lifetime of the block).
+  The five above add up to 100 %.
+  Example of the difference between runs: in the 3420 s run the same percentages are
+     fixpoint 47.0, search 1.7, backtrack 1.7, leaf check 0.25, IDLE 49.3   (sum 100).
+  While a block is alive it spends ~93 % in the fixpoint, but half of the kernel's capacity was empty.
+enr_kernel_pct_dive_overlaps_fixpoint=0.012   Time in the dives (11 levels before each subproblem). It OVERLAPS the
+                                        fixpoint (the dive fixpoints are also in enr_kernel_pct_fixpoint), so it is not
+                                        part of the 100 %.
+enr_kernel_nodes_per_sec=235,731        nodes / kernel time: the real throughput of the whole GPU, idle included.
+                                        (3420 s run: 145 k/s, against 235 k/s at full load = 62 %.)
+enr_kernel_deductions_per_sec=9.94e9    num_deductions / kernel time, whole GPU.
+enr_kernel_backtracks=21,165,241        The total number of restores from root_store (step IV). It is slightly below
+                                        failures: a failure that ends a subproblem (rope = -1, or failure at the
+                                        subproblem root) leads to no restore, and dive failures do not either.
+
+Blocks that run out of work (added 2026-11-10):
+  A block is "done" when it leaves the subproblem loop because no subproblem was left (num_blocks_done == 1),
+  NOT when it is stopped by the timeout or by the optimum being proven. All the times are measured from the block's
+  start_time, i.e. from the beginning of the kernel (all the blocks start together).
+enr_kernel_blocks_done                  How many blocks ran out of work before the end.
+enr_kernel_pct_blocks_done              The same, as a % of num_blocks: the share of block slots that were empty at the end.
+enr_kernel_first_block_done_sec         When the FIRST block ran out of work (-1 = none did).
+enr_kernel_first_block_done_pct_of_kernel   The same, as a % of enr_kernel_time_sec.
+enr_kernel_last_block_done_sec          When the LAST block that ran out of work exited (-1 = none did).
+                                        If every block is done (the search finished), it equals enr_kernel_time_sec.
+enr_kernel_last_block_done_pct_of_kernel    The same, as a % of enr_kernel_time_sec.
+  (These replace Turbo's first_block_idle_time, which is wrong: it holds the lifetime of the last block in the array.)
+
+Idle timeline ("enr_kernel idle timeline"): the kernel time is cut into 20 slices of 5 %. For each slice:
+  idle %              = the share of the num_blocks slots that were EMPTY during that slice, weighted by time
+                        (a block that exits in the middle of a slice counts as idle for the rest of that slice).
+                        The average of the 20 values = enr_kernel_pct_idle.
+  busy blocks at end  = how many blocks were still working at the end of the slice
+                        (blocks stopped by the timeout count as busy until the end).
+  Example (enr_small, the search finishes in 2.8 ms):
+     90- 95% of kernel   idle 15.96 %   busy blocks at end 21
+     95-100% of kernel   idle 78.74 %   busy blocks at end  1   <- the last block finishes alone
+
+
+6. ENR [block]: ONE SINGLE BLOCK  (avg = average over the 40 blocks; min/max over the 40 blocks)
+-------------------------------------------------------------------------------------------------
+"Block" = one of the 40 CUDA blocks (256 threads living for the whole kernel, solving many subproblems one after the other).
+enr_block_lifetime_sec_avg / _min / _max = 179.650 / 179.650 / 179.650
+                                        How long a block stays in the subproblem loop. When min << max, some blocks ran out
+                                        of subproblems early (3420 s run: avg 1734, min 489, max 3420).
+enr_block_nodes_avg / _min / _max = 1,058,727 / 971,901 / 1,143,143
+                                        The nodes explored by one block.
+enr_block_subproblems_avg / _min / _max = 37.3 / 3 / 254
+                                        The subproblems one block FINISHED (eps_solved_subproblems of that block).
+                                        Subtree sizes differ a lot: one block finished 254, another 3.
+enr_block_nodes_per_sec_avg=5,893       The speed of ONE block while it is alive (nodes / sum of lifetimes).
+                                        It does not drop when other blocks exit (if anything it rises: a block alone on an
+                                        SM runs ~14 % faster, -or 20 vs -or 40). x 40 = the kernel rate only when idle = 0.
+enr_block_deductions_per_sec_avg=248.6e6  The same for deductions. (The Turbo stat deductions_per_block_second divides by
+                                        the number of blocks twice: use this one.)
+
+
+7. ENR [node]: ONE SINGLE NODE, IN THE BLOCK THAT COMPUTES IT  (avg over all nodes)
+------------------------------------------------------------------------------------
+enr_node_time_us_avg=169.68             The total time ONE block spends on ONE node (fixpoint + split + backtrack + check)
+                                        = sum of lifetimes / nodes.
+enr_node_fixpoint_us_avg=160.15         The fixpoint of one node.
+enr_node_fixpoint_us_max=3716.10        The longest fixpoint of a single node (3.7 ms).
+enr_node_rounds_avg=15.54               Rounds per node (= fixpoint_iterations / nodes).
+enr_node_deductions_avg=42,177          Deductions per node (= num_deductions / nodes; see the WAC1 note in section 3).
+
+Node fixpoint-time histogram ("enr_node fixpoint-time histogram (us), percentage of the nodes")
+  For each node, thread 0 measures the fixpoint only (from the start of propagate() to the end of fixpoint()),
+  in whole microseconds (truncated), and adds 1 to the bin of that duration.
+  Bin b covers [2^(b-1), 2^b) us (bin 0 = under 1 us). The widths double, so the axis is logarithmic.
+  The percentage is relative to the number of NODES (not time). The counts add up to `nodes`.
+  Example: "[128, 256) us: 17404316 (41.10%)" = 17.4 M nodes (41 % of all nodes) had a fixpoint between 128 and 255 us.
+  Dive nodes are included.
+
+
+7b. ENR [restart]: ONE SINGLE RESTART AFTER A FAILURE INSIDE THE SUBPROBLEM  (added 2026-11-10)
+-----------------------------------------------------------------------------------------------
+A restart = what a block does after a failure inside its subproblem (step IV + the next node):
+   restore  = copy root_store -> store, re-embed the path decisions 0..depth-2, embed the right branch
+   fixpoint = the fixpoint of the node reached this way (it propagates the whole re-embedded path at once)
+   cost     = restore + fixpoint
+Thread 0 marks the block "after restore" at the end of step IV; the next propagate() records its fixpoint as part of the
+restart and clears the mark. Every other node (after a split, in the dive, at the subproblem root) is an "other node".
+Example values from a 30 s accap run:
+enr_restart_count=3,104,205            Restarts measured (= enr_kernel_backtracks minus the few cut by the timeout before
+                                        their fixpoint). enr_restart_count + enr_other_node_count = nodes.
+enr_restart_cost_us_avg=241.6          The average cost of ONE restart (restore + fixpoint), in the block that does it.
+enr_restart_restore_us_avg=6.8         Of which the restore (copy + re-embedding).
+enr_restart_fixpoint_us_avg=234.8      Of which the fixpoint.
+enr_restart_cost_us_max=2861           The most expensive single restart.
+enr_restart_rounds_avg=20.4            Fixpoint rounds of a restart node.
+enr_restart_path_len_avg=29.1          Decisions re-embedded per restart (depth below the subproblem root, right branch excluded).
+enr_restart_path_len_max=72
+enr_restart_pct_kernel=63.0            All restarts together, as % of the kernel (num_blocks x kernel time).
+enr_other_node_count=3,112,903         Nodes NOT reached by a restart (for comparison).
+enr_other_node_fixpoint_us_avg=127.9   Their average fixpoint: 1 new decision on an already propagated parent.
+enr_other_node_rounds_avg=12.8
+Restart cost histogram: like the node histogram, but of restore + fixpoint of each restart; % of the restarts.
+Reading: a restart's fixpoint costs 1.84x a normal node's (234.8 vs 127.9 us, 20.4 vs 12.8 rounds), because it has to
+re-propagate ~29 decisions at once from the subproblem root. The difference (~107 us x 3.1 M restarts) is the price of
+recomputation instead of saving the propagated parent.
+
+
+8. ENR [prog]: THE WHOLE PROGRAM  ([H], percentages of enr_prog_total_sec)
+---------------------------------------------------------------------------
+Measured with std::chrono::steady_clock in barebones_dive_and_solve(). Each *_pct = phase / enr_prog_total_sec.
+enr_prog_total_sec covers from the start of barebones_dive_and_solve() to the end of printing. It does not include
+what comes before (process start, reading the command line) or after (deallocate_global_data, process exit).
+
+enr_prog_check_managed_memory_and_cuda_init  check_support_managed_memory*(): the first CUDA calls, so it includes the
+                                             creation of the CUDA context (~0.1-0.2 s).
+enr_prog_parse_preprocess                    CP<Itv> cp(config) + cp.preprocess(): parsing, TNF, simplification (CPU).
+enr_prog_configure_gpu_barebones             configure_gpu_barebones(): occupancy query, number of subproblems, heap limit
+                                             (cudaDeviceSetLimit), stack, shared memory configuration (cudaFuncSetAttribute).
+enr_prog_alloc_unified_data                  make_unique<UnifiedData, managed_allocator>: cudaMallocManaged + copying the root problem.
+enr_prog_initialize_global_data              Launch + wait of initialize_global_data<<<1,1>>> (GridData, 40 BlockData, decisions).
+enr_prog_gpu_barebones_solve                 From the solve kernel launch until it finishes (cudaDeviceSynchronize), including
+                                             the host waiting loop. ~= timeout - setup time.
+enr_prog_reduce_blocks                       Launch + wait of reduce_blocks<<<1,1>>> (summing the statistics, best solution).
+enr_prog_print_solution_and_stats            Printing the solution and the statistics.
+
+
+9. QUICK ANSWER: "WHAT IS EACH NUMBER RELATIVE TO?"
+----------------------------------------------------
+  enr_kernel_pct_*        -> num_blocks x kernel time (the whole kernel; with idle they add up to 100)
+  enr_kernel_*_per_sec    -> the whole GPU, per second of kernel
+  enr_block_*             -> ONE block (avg / min / max over the blocks)
+  enr_node_*              -> ONE node, in the block that computes it (avg over the nodes)
+  enr_restart_*           -> ONE restart after a failure (restore + its fixpoint), avg over the restarts
+  enr_prog_*_pct          -> the WHOLE PROGRAM wall time (from barebones_dive_and_solve start)
+  histogram %             -> the number of NODES (not time)
+
+==========================================================================================
+[phases] (added 2026-11-11) -- replaces enr_kernel_pct_fixpoint / _search_split_other /
+_backtrack_restore / _leaf_check / _idle / _dive_overlaps_fixpoint, which no longer exist.
+==========================================================================================
+Each block charges every nanosecond of its lifetime to exactly one phase (ENR_PH macro in
+barebones_dive_and_solve.hpp: "time since the previous ENR_PH goes to phase P"). The phases
+are exclusive and contiguous, so  enr_pct_dive + enr_pct_search + enr_pct_backtrack +
+enr_pct_idle = 100  (enr_pct_check_sum prints that sum). pct = share of num_blocks x kernel time
+= average over the blocks of (phase time of the block / kernel time).
+
+  enr_pct_dive                  = subproblem_switch + dive_fixpoint + dive_branch
+    _dive_subproblem_switch       G (atomic next subproblem) + loop head + C (copy of the global root)
+    _dive_fixpoint                fixpoints of the nodes of the dive (<= subproblems_power per dive)
+    _dive_branch                  split + commit to the branch of the path during the dive
+  enr_pct_search                = search_fixpoint + search_branch   (solve phase F, going DOWN)
+    _search_fixpoint              fixpoint of a node reached by a split (left branch)
+    _search_branch                objective bound, root snapshot, split, decision, rope lookup
+  enr_pct_backtrack             = restore + redescend + backtrack_fixpoint   (one "restart")
+    _backtrack_restore            copy root_store -> store
+    _backtrack_redescend          re-apply the decisions of the path + take the right branch
+    _backtrack_fixpoint           fixpoint of the node reached by the redescend
+  enr_pct_idle                    blocks already out of the loop (stop latency or no work left)
+  enr_pct_fixpoint_all            dive_fixpoint + search_fixpoint + backtrack_fixpoint
+
+Timing points (2026-11-11 later): the three *_fixpoint phases are measured AROUND the calls
+propagate() in barebones (dive loop and solve step F.II), so each one is the whole propagate():
+fixpoint + leaf check (fp_engine.select) + solution copy + nodes++/stop check. Compared with the
+first version (timed inside propagate) about 0.5 pct points moved from search_branch to the fixpoints.
+
+Counts are totals over all blocks; *_us_avg is the time of ONE occurrence:
+  enr_dives (= subproblems started), enr_dive_us_avg (whole dive incl. switch),
+  enr_dive_nodes + enr_search_nodes + enr_restart_count = nodes (exact),
+  enr_search_branch_us_per_node_avg (per search or after-backtrack node),
+  enr_backtracks, enr_backtrack_{restore,redescend,fixpoint}_us_avg, enr_backtrack_us_avg (sum).
+
+------------------------------------------------------------------------------------------
+Cleanup 2026-11-11 (user request):
+  [phases] counts now printed as fixpoints, one per node, three disjoint kinds:
+    enr_dive_fixpoints / enr_search_fixpoints / enr_backtrack_last_fixpoints (+ _us_avg each),
+    enr_total_fixpoints (= nodes) and enr_total_fixpoint_us_avg (avg of one propagate(), all kinds).
+  enr_dive_nodes / enr_search_nodes renamed as above; enr_search_branch_us_per_node_avg removed.
+  enr_backtrack_us_avg renamed enr_backtrack_whole_us_avg (restore + redescend + last fixpoint).
+  enr_total_backtracks removed (same as enr_backtracks).
+  [restart] section removed (enr_restart_*, enr_other_node_*); only its histogram is kept, titled
+  "[backtrack] cost of one backtrack" = restore + redescend + pure fixpoint (no leaf check).
+
+===========================================================================================================
+2026-11-23: NAMES OF THE LOAD-BALANCING RESTART STATISTICS
+===========================================================================================================
+Everything added for the load-balancing restart now has the enr_ prefix:
+  tree_nodes / tree_failures / redundant_dive_nodes   -> enr_tree_nodes / enr_tree_failures / enr_redundant_dive_nodes
+  restarts, restart_items_*, restart_subproblems_sum,
+  restart_s_max, restart_truncated_blocks,
+  restart_drain_ms_*, restart_first_sec/last_sec      -> enr_restarts, enr_restart_* (same suffixes)
+  restart_idle_pct / _min_ms / _subfactor / _max      -> enr_restart_* (the command-line flags are still -restart ...)
+CAUTION, same prefix, different meaning: the enr_restart_* names of section 7b above (2026-11-10, removed 2026-11-11)
+meant ONE BACKTRACK (restore + its fixpoint). Since 2026-11-23 enr_restart_* only means the load-balancing restart;
+the backtrack statistics are enr_backtrack_* (function enr_record_backtrack, formerly enr_record_restart).
+compare_restart_stats.py and analyze_mznc_results.py read both the old and the new names.

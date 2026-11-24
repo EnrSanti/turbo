@@ -40,3 +40,14 @@ benchmarks/.ipynb_checkpoints
 
 # Libre office
 benchmarks/.~*
+# ENR: heavy / generated / local stuff, never tracked
+# benchmarks (instances, MZC 2024 fzn, enr_small tests and their results); keep only upstream's MiniZinc solver config
+benchmarks/*
+!benchmarks/minizinc/
+logs/
+pdfs/
+*.pdf
+.claude/
+__pycache__/
+*.pyc
+equality_thesis/

@@ -47,6 +47,8 @@ struct Configuration {
   size_t or_nodes;
   int subproblems_power;
   size_t subproblems_factor;
+  size_t enr_restart_idle_pct;   //ENR CODE: barebones load-balancing restart when this % of the blocks is idle (0 = disabled).
+  bool enr_restart_each_block;   //ENR CODE: restart as soon as one block is idle (-restart_each_block).
   size_t stack_kb;
   Arch arch;
   FixpointKind fixpoint;
@@ -74,6 +76,7 @@ struct Configuration {
     or_nodes(0),
     subproblems_power(-1),
     subproblems_factor(30),
+    enr_restart_idle_pct(0), enr_restart_each_block(false), //ENR CODE
     stack_kb(
       #ifdef TURBO_IPC_ABSTRACT_DOMAIN
         32
@@ -124,6 +127,7 @@ struct Configuration {
     or_nodes(other.or_nodes),
     subproblems_power(other.subproblems_power),
     subproblems_factor(other.subproblems_factor),
+    enr_restart_idle_pct(other.enr_restart_idle_pct), enr_restart_each_block(other.enr_restart_each_block), //ENR CODE
     stack_kb(other.stack_kb),
     arch(other.arch),
     fixpoint(other.fixpoint),
@@ -153,6 +157,7 @@ struct Configuration {
     or_nodes = other.or_nodes;
     subproblems_power = other.subproblems_power;
     subproblems_factor = other.subproblems_factor;
+    enr_restart_idle_pct = other.enr_restart_idle_pct; enr_restart_each_block = other.enr_restart_each_block; //ENR CODE
     stack_kb = other.stack_kb;
     arch = other.arch;
     fixpoint = other.fixpoint;
@@ -206,6 +211,9 @@ struct Configuration {
     printf("%s", problem_path.data());
   }
 
+  //ENR CODE: the load-balancing restart is on (-restart P with P > 0, or -restart_each_block).
+  CUDA bool enr_restart_on() const { return enr_restart_idle_pct > 0 || enr_restart_each_block; }
+
   CUDA const char* name_of_fixpoint(FixpointKind fixpoint) const {
     switch(fixpoint) {
       case FixpointKind::AC1:
@@ -247,6 +255,10 @@ struct Configuration {
       printf("%%%%%%mzn-stat: wac1_threshold=%" PRIu64 "\n", wac1_threshold);
     }
     printf("%%%%%%mzn-stat: seed=%" PRIu64 "\n", seed);
+    if(enr_restart_on()) { //ENR STATS
+      printf("%%%%%%mzn-stat: enr_restart_idle_pct=%" PRIu64 "\n", enr_restart_idle_pct); //ENR STATS
+      printf("%%%%%%mzn-stat: enr_restart_each_block=\"%s\"\n", enr_restart_each_block ? "yes" : "no"); //ENR STATS
+    } //ENR STATS
     printf("%%%%%%mzn-stat: eps_var_order=\"%s\"\n", eps_var_order.data());
     printf("%%%%%%mzn-stat: eps_value_order=\"%s\"\n", eps_value_order.data());
     printf("%%%%%%mzn-stat: free_search=\"%s\"\n", free_search ? "yes" : "no");
